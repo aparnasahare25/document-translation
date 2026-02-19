@@ -1,0 +1,5 @@
+# Environment / secrets
+.env
+
+# OS
+.DS_Store
