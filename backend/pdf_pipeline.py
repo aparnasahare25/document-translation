@@ -1375,6 +1375,8 @@ def _normalize_translate_blocks_result(result) -> Tuple[List[BlockTranslation], 
 def _translate_blocks_with_optional_diagnostics(
     blocks: List[BlockRef],
     *,
+    source_lang: Optional[str] = None,
+    target_lang: Optional[str] = None,
     verbose: bool = False,
 ) -> Tuple[List[BlockTranslation], Dict[str, Any]]:
     """
@@ -1393,6 +1395,10 @@ def _translate_blocks_with_optional_diagnostics(
         kw: Dict[str, Any] = {}
         if "verbose" in params:
             kw["verbose"] = verbose
+        if "source_lang" in params:
+            kw["source_lang"] = source_lang
+        if "target_lang" in params:
+            kw["target_lang"] = target_lang
         if "return_diagnostics" in params:
             kw["return_diagnostics"] = True
         if "with_diagnostics" in params:
@@ -1442,13 +1448,19 @@ def _translate_blocks_with_optional_diagnostics(
     return translations, diagnostics
 
 
-def translate_pdf_bytes_pipeline(pdf_bytes: bytes, *, verbose: bool = False) -> bytes:
+def translate_pdf_bytes_pipeline(
+    pdf_bytes: bytes, 
+    *, 
+    source_lang: Optional[str] = None, 
+    target_lang: Optional[str] = None, 
+    verbose: bool = False
+) -> bytes:
     total_t0 = time.perf_counter()
     extraction_time = translation_time = apply_time = save_time = 0.0
     diagnostics: Dict[str, Any] = {}
     errors = 0
 
-    _vprint(verbose, "[PIPELINE] Starting PDF Translation pipeline...")
+    _vprint(verbose, f"[PIPELINE] Starting PDF Translation pipeline | {source_lang} -> {target_lang}...")
     _vprint(verbose, "[PIPELINE] Extracting blocks with Azure Document Intelligence...")
 
     t0 = time.perf_counter()
@@ -1459,7 +1471,12 @@ def translate_pdf_bytes_pipeline(pdf_bytes: bytes, *, verbose: bool = False) -> 
     try:
         t1 = time.perf_counter()
         # PoC: translation_service handles the 3-stage pipeline - wrapped with optional diagnostics
-        translations, diagnostics = _translate_blocks_with_optional_diagnostics(blocks, verbose=verbose)
+        translations, diagnostics = _translate_blocks_with_optional_diagnostics(
+            blocks, 
+            source_lang=source_lang, 
+            target_lang=target_lang, 
+            verbose=verbose
+        )
         translation_time = time.perf_counter() - t1
 
         _vprint(verbose, f"[PIPELINE] Translations obtained: {len(translations)} items in {translation_time:.2f}s")

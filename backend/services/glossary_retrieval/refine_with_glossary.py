@@ -22,7 +22,7 @@ from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.models import VectorizedQuery
 
-from services.glossary_retrieval.prompts import placeholder_sys_prompt, no_placeholder_sys_prompt
+from services.glossary_retrieval.prompts import get_placeholder_sys_prompt, get_no_placeholder_sys_prompt
 
 
 # -------------------------
@@ -283,11 +283,17 @@ json_glossary = _load_json(glossary_path)
 # LANG NORMALIZATION + FILTER BUILDING (Azure AI Search)
 # -----------------------------------------------------------------------------
 def _normalize_lang(lang: Optional[str]) -> str:
-    t = (lang or "").strip()
+    t = (lang or "").strip().lower()
     if not t:
         return ""
-    # accept "de-DE" -> "de"
-    t = t.split("-", 1)[0].lower()
+    mapping = {
+        "english": "en", "japanese": "ja", "german": "de",
+        "french": "fr", "spanish": "es", "italian": "it",
+        "portuguese": "pt", "dutch": "nl", "russian": "ru",
+        "chinese": "zh", "korean": "ko", "arabic": "ar"
+    }
+    t = mapping.get(t, t)
+    t = t.split("-", 1)[0]
     return re.sub(r"\s+", "", t)
 
 def _escape_odata_string(value: str) -> str:
@@ -479,6 +485,8 @@ def build_refinement_prompt(
     is_placeholder: bool,
     glossary: Dict[str, Any],
     verbose: bool,
+    source_lang: str,
+    target_lang: str,
 ) -> Dict[str, Any]:
     """
     LLM sees:
@@ -491,7 +499,10 @@ def build_refinement_prompt(
     if verbose:
         _step("BUILDING REFINEMENT PROMPT")
 
-    system_msg = (placeholder_sys_prompt if is_placeholder else no_placeholder_sys_prompt).strip()
+    if is_placeholder:
+        system_msg = get_placeholder_sys_prompt(source_lang, target_lang).strip()
+    else:
+        system_msg = get_no_placeholder_sys_prompt(source_lang, target_lang).strip()
 
     user_payload = {
         "source_en": english_chunk,
@@ -521,6 +532,7 @@ def refine_segment_with_glossary(
     verbose: bool,
     top_k_paragraphs: int = 5,
     *,
+    source_lang: Optional[str] = None,
     target_lang: Optional[str] = None,
 ) -> str:
     """
@@ -574,6 +586,8 @@ def refine_segment_with_glossary(
         is_placeholder,
         json_glossary,
         verbose=verbose,
+        source_lang=source_lang or "en",
+        target_lang=target_lang or "ja",
     )
 
     llm_output = call_llm_json(prompt["system"], prompt["user_payload"], verbose=verbose)
@@ -593,6 +607,7 @@ def refine_document_with_glossary(
     verbose: bool,
     top_k_paragraphs: int = 5,
     *,
+    source_lang: Optional[str] = None,
     target_lang: Optional[str] = None,
 ) -> List[str]:
     """
@@ -619,6 +634,7 @@ def refine_document_with_glossary(
             is_placeholder=is_placeholder,
             verbose=verbose,
             top_k_paragraphs=top_k_paragraphs,
+            source_lang=source_lang,
             target_lang=target_lang,
         )
         out.append(result)

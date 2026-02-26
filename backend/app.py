@@ -3,7 +3,7 @@ from __future__ import annotations
 import io, os
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 
 from pdf_pipeline import translate_pdf_bytes_pipeline
 
@@ -14,7 +14,11 @@ app = FastAPI(title="PDF Translator (Pipeline Starter)")
 
 
 @app.post("/translate")
-async def translate_pdf(file: UploadFile = File(...)):
+async def translate_pdf(
+    file: UploadFile = File(...),
+    source_lang: str = Form("en"),
+    target_lang: str = Form("ja")
+):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
 
@@ -23,11 +27,11 @@ async def translate_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file.")
 
     try:
-        out_bytes = translate_pdf_bytes_pipeline(pdf_bytes, verbose=VERBOSE_FLAG)
+        out_bytes = translate_pdf_bytes_pipeline(pdf_bytes, source_lang=source_lang, target_lang=target_lang, verbose=VERBOSE_FLAG)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
-    headers = {"Content-Disposition": f'attachment; filename="translated_{file.filename}"'}
+    headers = {"Content-Disposition": f'attachment; filename="translated_{source_lang}_to_{target_lang}_{file.filename}"'}
     return StreamingResponse(io.BytesIO(out_bytes), media_type="application/pdf", headers=headers)
 
 

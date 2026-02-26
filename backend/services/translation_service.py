@@ -51,8 +51,14 @@ VERBOSE = os.getenv("PDF_TRANSLATION_VERBOSE", "1").strip().lower() in ("1", "tr
 _PLACEHOLDER_RE = re.compile(r"\[\[[^\]]+\]\]")
 
 def _norm_lang(lang: str) -> str:
-    # accept "de-DE" etc -> "de"
-    t = (lang or "").strip()
+    t = (lang or "").strip().lower()
+    mapping = {
+        "english": "en", "japanese": "ja", "german": "de",
+        "french": "fr", "spanish": "es", "italian": "it",
+        "portuguese": "pt", "dutch": "nl", "russian": "ru",
+        "chinese": "zh", "korean": "ko", "arabic": "ar"
+    }
+    t = mapping.get(t, t)
     return t.split("-", 1)[0] if t else t
 
 def _has_alpha(s: str) -> bool:
@@ -218,7 +224,7 @@ def _llm1_refine(
     target_lang: str,
 ) -> str:
     system = (
-        "You are a professional technical translator and editor.\n"
+        f"You are a professional technical translator and editor ({source_lang.upper()} -> {target_lang.upper()}).\n"
         "Task: Improve the provided machine translation so it is grammatically correct, fluent, and faithful.\n"
         "Rules:\n"
         " - Preserve meaning exactly.\n"
@@ -553,6 +559,7 @@ def translate_blocks(
                 is_placeholder=is_placeholder,
                 verbose=eff_verbose, # use effective verbose, not env-only VERBOSE
                 top_k_paragraphs=top_k_paragraphs,
+                source_lang=source_lang,
                 target_lang=target_lang
             )
             if is_placeholder and not _preserves_placeholders(refined, src):
