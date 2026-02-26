@@ -1,0 +1,1758 @@
+from __future__ import annotations
+
+from dotenv import load_dotenv
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+import os, fitz, io, re, threading, time, inspect, math # PyMuPDF (used for writing back into the PDF)
+
+# Azure Document Intelligence
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+
+from services.translation_service import translate_blocks
+
+
+# -----------------------------
+# Env
+# -----------------------------
+load_dotenv(override=True)
+
+doc_int_key = "AZURE_DOCUMENT_INTELLIGENCE_KEY"
+doc_int_endpoint = "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"
+doc_int_model = "AZURE_DOCUMENT_INTELLIGENCE_MODEL_ID" # default: prebuilt-layout
+
+
+# -----------------------------
+# Verbose logging helpers
+# -----------------------------
+def _vprint(verbose: bool, *args, **kwargs) -> None:
+    if verbose:
+        print(*args, **kwargs)
+
+
+def _fmt_bbox(bbox: Tuple[float, float, float, float]) -> str:
+    x0, y0, x1, y1 = bbox
+    return f"({x0:.2f}, {y0:.2f}, {x1:.2f}, {y1:.2f})"
+
+
+def _preview_text(text: str, limit: int = 220) -> str:
+    s = (text or "").replace("\n", "\\n")
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1] + "…"
+
+
+def _log_every_five_extracted(items: List["_ExtractItem"], verbose: bool) -> None:
+    if not verbose:
+        return
+    total = len(items)
+    if total == 0 or total % 5 != 0:
+        return
+
+    print(f"[EXTRACT][BATCH] Reached {total} extracted blocks. Showing latest 5 Azure DocInt-derived items:")
+    for idx, it in enumerate(items[-5:], start=total - 4):
+        print(
+            f"  #{idx:04d} | source={it.source_kind:<10} | page={it.page_index} | "
+            f"bbox={_fmt_bbox(it.bbox)} | min_offset={it.min_offset} | spans={len(it.spans)}"
+        )
+        print(f"         text={_preview_text(it.text)}")
+
+
+def _print_skip_summary(verbose: bool, stage_name: str, stats: Dict[str, int]) -> None:
+    if not verbose:
+        return
+    seen = stats.get("seen", 0)
+    added = stats.get("added", 0)
+    skipped_total = seen - added
+    print(f"[EXTRACT][{stage_name}] seen={seen}, added={added}, skipped={skipped_total}")
+    for k in sorted(stats.keys()):
+        if k in {"seen", "added"}:
+            continue
+        print(f"  - {k}: {stats[k]}")
+
+
+def _avg(numer: float, denom: int) -> float:
+    return (float(numer)/float(denom)) if denom else 0.0
+
+
+def _coalesce_number(*vals, default: float = 0.0) -> float:
+    for v in vals:
+        if v is None: continue
+        try: return float(v)
+        except Exception: continue
+    return float(default)
+
+
+def _coalesce_int(*vals, default: int = 0) -> int:
+    for v in vals:
+        if v is None: continue
+        try: return int(v)
+        except Exception: continue
+    return int(default)
+
+
+def _diag_lookup(diag: Dict[str, Any], *keys, default=None):
+    cur: Any = diag
+    for k in keys:
+        if not isinstance(cur, dict): return default
+        cur = cur.get(k)
+        if cur is None: return default
+    return cur
+
+
+def _print_translation_samples(
+    blocks: List["BlockRef"],
+    translations: List["BlockTranslation"],
+    diagnostics: Dict[str, Any],
+    *,
+    verbose: bool,
+) -> None:
+    if not verbose: return
+
+    llm1_pairs = (
+        _diag_lookup(diagnostics, "llm1_pairs")
+        or _diag_lookup(diagnostics, "samples", "llm1_pairs")
+        or _diag_lookup(diagnostics, "debug", "llm1_pairs")
+    )
+
+    if isinstance(llm1_pairs, list) and llm1_pairs:
+        print("[TRANSLATE] LLM-1 original vs translated samples (1 in 5):")
+        for i, pair in enumerate(llm1_pairs, start=1):
+            if i % 5 != 0: continue
+            if isinstance(pair, dict):
+                src = pair.get("original") or pair.get("source") or pair.get("input") or ""
+                dst = pair.get("translated") or pair.get("output") or pair.get("llm1_output") or ""
+            elif isinstance(pair, (tuple, list)) and len(pair) >= 2: src, dst = pair[0], pair[1]
+            else: continue
+            print(f"  [LLM-1 sample #{i}] original  : {_preview_text(str(src), 180)}")
+            print(f"  [LLM-1 sample #{i}] translated: {_preview_text(str(dst), 180)}")
+        return
+
+    # fallback if translation_service doesn't expose LLM-1 diagnostics
+    print("[TRANSLATE] LLM-1 samples unavailable from translation_service; showing FINAL original vs translated samples (1 in 5):")
+    for i, bt in enumerate(translations, start=1):
+        if i % 5 != 0:
+            continue
+        print(f"  [Final sample #{i}] original  : {_preview_text(bt.block.text, 180)}")
+        print(f"  [Final sample #{i}] translated: {_preview_text(bt.translated_text, 180)}")
+
+
+def _fmt_float(x: Optional[float], nd: int = 2) -> str:
+    if x is None:
+        return "None"
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return str(x)
+
+
+def _print_timing_report(
+    *,
+    verbose: bool,
+    chunks_processed: int,
+    extraction_time: float,
+    translation_time: float,
+    apply_time: float,
+    save_time: float,
+    total_time: float,
+    diagnostics: Optional[Dict[str, Any]] = None,
+    errors: int = 0,
+) -> None:
+    if not verbose: return
+
+    diagnostics = diagnostics or {}
+
+    cache_hits = _coalesce_int(
+        _diag_lookup(diagnostics, "cache_hits"),
+        _diag_lookup(diagnostics, "stats", "cache_hits"),
+        _diag_lookup(diagnostics, "counts", "cache_hits"),
+        default=0,
+    )
+    azure_mt_total = _coalesce_number(
+        _diag_lookup(diagnostics, "azure_mt_total"),
+        _diag_lookup(diagnostics, "timings", "azure_mt_total"),
+        _diag_lookup(diagnostics, "timings", "azure_mt_seconds"),
+        _diag_lookup(diagnostics, "stats", "azure_mt_total"),
+        default=0.0,
+    )
+    llm1_total = _coalesce_number(
+        _diag_lookup(diagnostics, "llm1_total"),
+        _diag_lookup(diagnostics, "timings", "llm1_total"),
+        _diag_lookup(diagnostics, "timings", "llm1_seconds"),
+        _diag_lookup(diagnostics, "stats", "llm1_total"),
+        default=0.0,
+    )
+    llm2_total = _coalesce_number(
+        _diag_lookup(diagnostics, "llm2_total"),
+        _diag_lookup(diagnostics, "timings", "llm2_total"),
+        _diag_lookup(diagnostics, "timings", "llm2_seconds"),
+        _diag_lookup(diagnostics, "stats", "llm2_total"),
+        default=0.0,
+    )
+
+    # if diagnostics does not provide per-chunk sum, use translation time as sensible fallback
+    end_to_end_sum = _coalesce_number(
+        _diag_lookup(diagnostics, "end_to_end_sum"),
+        _diag_lookup(diagnostics, "timings", "end_to_end_sum"),
+        _diag_lookup(diagnostics, "stats", "end_to_end_sum"),
+        default=translation_time,
+    )
+
+    print("\nTiming report")
+    print("-------------")
+    print(f"  Chunks processed     : {chunks_processed}")
+    print(f"  Cache hits           : {cache_hits}")
+    print(f"  Azure MT total       : {azure_mt_total:.2f} | avg/chunk: {_avg(azure_mt_total, chunks_processed):.2f}")
+    print(f"  LLM-1 total          : {llm1_total:.2f} | avg/chunk: {_avg(llm1_total, chunks_processed):.2f}")
+    print(f"  LLM-2 total          : {llm2_total:.2f} | avg/chunk: {_avg(llm2_total, chunks_processed):.2f}")
+    print(f"  End-to-end (sum)     : {end_to_end_sum:.2f} | avg/chunk: {_avg(end_to_end_sum, chunks_processed):.2f}")
+    print(f"  Errors               : {errors}")
+    print("  -- pipeline stages --")
+    print(f"  Text extraction      : {extraction_time:.2f}")
+    print(f"  Translation          : {translation_time:.2f}")
+    print(f"  Apply translations   : {apply_time:.2f}")
+    print(f"  Save PDF             : {save_time:.2f}")
+    print(f"  Total pipeline       : {total_time:.2f}")
+
+
+# -----------------------------
+# Data models
+# -----------------------------
+@dataclass(frozen=True)
+class BlockRef:
+    page_index: int
+    bbox: Tuple[float, float, float, float] # fitz coords (points)
+    text: str
+
+
+@dataclass(frozen=True)
+class BlockTranslation:
+    block: BlockRef
+    translated_text: str
+
+
+# -----------------------------
+# Azure Doc Intelligence extraction (read-only)
+# -----------------------------
+_doc_int_client: Optional[DocumentIntelligenceClient] = None
+
+
+def _get_doc_int_client(verbose: bool = False) -> DocumentIntelligenceClient:
+    global _doc_int_client
+    if _doc_int_client is not None:
+        _vprint(verbose, "[DOCINT] Reusing cached DocumentIntelligenceClient")
+        return _doc_int_client
+
+    endpoint = os.getenv(doc_int_endpoint, "").strip()
+    key = os.getenv(doc_int_key, "").strip()
+    if not endpoint or not key:
+        raise RuntimeError(
+            f"Missing Azure Document Intelligence credentials. "
+            f"Set {doc_int_endpoint} and {doc_int_key} in your environment."
+        )
+
+    _vprint(verbose, f"[DOCINT] Creating DocumentIntelligenceClient for endpoint={endpoint!r}")
+    _doc_int_client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
+    return _doc_int_client
+
+
+_PUNCT_FIX_RE = re.compile(r"\s+([,.;:!?])")
+def _join_words_preserve_punct(words: List[str]) -> str:
+    s = " ".join(w for w in words if w)
+    s = _PUNCT_FIX_RE.sub(r"\1", s)
+    s = s.replace("( ", "(").replace(" )", ")")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _poly_to_bbox(poly) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Accepts either:
+        - [x0,y0, x1,y1, x2,y2, x3,y3] (flat float list)
+        - [{x:..., y:...}, ...] or objects with .x/.y
+    Returns bbox (x0,y0,x1,y1) in the same unit as polygon.
+    """
+    if not poly:
+        return None
+
+    # flat list [x0,y0,x1,y1,...]
+    if isinstance(poly, list) and poly and isinstance(poly[0], (int, float)):
+        if len(poly) < 8:
+            return None
+        xs = poly[0::2]
+        ys = poly[1::2]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    # list of points
+    xs: List[float] = []
+    ys: List[float] = []
+    try:
+        for p in poly:
+            if isinstance(p, dict):
+                xs.append(float(p.get("x")))
+                ys.append(float(p.get("y")))
+            else:
+                xs.append(float(getattr(p, "x")))
+                ys.append(float(getattr(p, "y")))
+        if not xs or not ys:
+            return None
+        return (min(xs), min(ys), max(xs), max(ys))
+    except Exception:
+        return None
+
+
+def _scale_bbox(bbox: Tuple[float, float, float, float], sx: float, sy: float) -> Tuple[float, float, float, float]:
+    x0, y0, x1, y1 = bbox
+    return (x0 * sx, y0 * sy, x1 * sx, y1 * sy)
+
+
+def _union_bbox(bboxes: List[Tuple[float, float, float, float]]) -> Tuple[float, float, float, float]:
+    x0 = min(b[0] for b in bboxes)
+    y0 = min(b[1] for b in bboxes)
+    x1 = max(b[2] for b in bboxes)
+    y1 = max(b[3] for b in bboxes)
+    return (x0, y0, x1, y1)
+
+
+def _spans_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
+    return not (a1 <= b0 or b1 <= a0)
+
+
+def _min_span_offset(spans) -> Optional[int]:
+    if not spans: return None
+    offs = []
+    for s in spans:
+        try: offs.append(int(s.offset))
+        except Exception: pass
+    return min(offs) if offs else None
+
+
+def _span_ranges(spans) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    if not spans: return out
+    for s in spans:
+        try:
+            o = int(s.offset)
+            l = int(s.length)
+            out.append((o, o + l))
+        except Exception: continue
+    return out
+
+
+def _any_overlap(ranges_a: List[Tuple[int, int]], ranges_b: List[Tuple[int, int]]) -> bool:
+    for a0, a1 in ranges_a:
+        for b0, b1 in ranges_b:
+            if _spans_overlap(a0, a1, b0, b1): return True
+    return False
+
+
+@dataclass(frozen=True)
+class _ExtractItem:
+    page_index: int
+    bbox: Tuple[float, float, float, float]
+    text: str
+    min_offset: Optional[int]
+    # keep spans only for overlap checks (not exposed outside)
+    spans: List[Tuple[int, int]]
+    source_kind: str # "table_cell" or "paragraph"
+
+
+def _extract_items_from_docintel_result(doc: fitz.Document, analyze_result, *, verbose: bool = False) -> List[_ExtractItem]: # line-level extraction
+    """
+    Extract layout-faithful translation units:
+        - table cells
+        - line runs (DocInt lines split into left/right runs by large x-gaps)
+    Avoid duplication by skipping line runs whose spans overlap table-cell spans.
+    """
+    items: List[_ExtractItem] = []
+
+    if not getattr(analyze_result, "pages", None):
+        _vprint(verbose, "[EXTRACT] analyze_result.pages is empty; nothing to extract")
+        return items
+
+    # -------------------------
+    # Page scale factors (DI -> fitz points)
+    # -------------------------
+    page_scale: Dict[int, Tuple[float, float]] = {}
+    _vprint(verbose, f"[EXTRACT] Computing page scale factors for {len(analyze_result.pages)} DI pages")
+
+    for page_obj in analyze_result.pages:
+        page_number_1 = getattr(page_obj, "page_number", None) or getattr(page_obj, "pageNumber", None)
+        if not page_number_1:
+            _vprint(verbose, "[EXTRACT][PAGE-SCALE] Skipping DI page without page_number")
+            continue
+        page_index = int(page_number_1) - 1
+        if page_index < 0 or page_index >= doc.page_count:
+            _vprint(verbose, f"[EXTRACT][PAGE-SCALE] Skipping DI page_number={page_number_1}; out of fitz range")
+            continue
+
+        fitz_page = doc[page_index]
+        fitz_w = float(fitz_page.rect.width)
+        fitz_h = float(fitz_page.rect.height)
+
+        di_w = float(getattr(page_obj, "width", 0.0) or 0.0)
+        di_h = float(getattr(page_obj, "height", 0.0) or 0.0)
+
+        if di_w <= 0 or di_h <= 0:
+            sx = sy = 72.0
+            _vprint(verbose, f"[EXTRACT][PAGE-SCALE] p{page_index}: missing DI dimensions, fallback sx=sy=72.0")
+        else:
+            sx = fitz_w / di_w
+            sy = fitz_h / di_h
+            _vprint(
+                verbose,
+                f"[EXTRACT][PAGE-SCALE] p{page_index}: DI({di_w:.3f}x{di_h:.3f}) -> "
+                f"PDF({fitz_w:.3f}x{fitz_h:.3f}) => sx={sx:.6f}, sy={sy:.6f}",
+            )
+        page_scale[page_index] = (sx, sy)
+
+    # -------------------------
+    # 1) TABLE CELLS
+    # -------------------------
+    table_stats: Dict[str, int] = {
+        "seen": 0,
+        "added": 0,
+        "skipped_empty_text": 0,
+        "skipped_no_valid_page_or_bbox": 0,
+        "skipped_tiny_area": 0,
+    }
+    line_stats: Dict[str, int] = {
+        "seen": 0,
+        "added": 0,
+        "skipped_empty_text": 0,
+        "skipped_table_span_overlap": 0,
+        "skipped_no_words_for_line": 0,
+        "skipped_no_valid_page_or_bbox": 0,
+        "skipped_tiny_area": 0,
+    }
+
+    table_cell_span_ranges: List[Tuple[int, int]] = []
+    all_tables = (getattr(analyze_result, "tables", None) or [])
+    _vprint(verbose, f"[EXTRACT][TABLE_CELLS] DI tables found: {len(all_tables)}")
+
+    for ti, table in enumerate(all_tables, start=1):
+        cells = (getattr(table, "cells", None) or [])
+        _vprint(verbose, f"[EXTRACT][TABLE_CELLS] Table #{ti}: cells={len(cells)}")
+
+        for ci, cell in enumerate(cells, start=1):
+            table_stats["seen"] += 1
+
+            text = (getattr(cell, "content", "") or "").strip()
+            if not text:
+                table_stats["skipped_empty_text"] += 1
+                continue
+
+            spans = _span_ranges(getattr(cell, "spans", None) or [])
+            if spans:
+                table_cell_span_ranges.extend(spans)
+
+            brs = getattr(cell, "bounding_regions", None) or []
+            cell_bboxes: List[Tuple[float, float, float, float]] = []
+            page_index: Optional[int] = None
+
+            for br in brs:
+                pno = getattr(br, "page_number", None) or getattr(br, "pageNumber", None)
+                if not pno:
+                    continue
+                pi = int(pno) - 1
+                if pi < 0 or pi >= doc.page_count:
+                    continue
+                poly = getattr(br, "polygon", None)
+                bb = _poly_to_bbox(poly)
+                if not bb:
+                    continue
+                sx, sy = page_scale.get(pi, (72.0, 72.0))
+                bb = _scale_bbox(bb, sx, sy)
+                cell_bboxes.append(bb)
+                page_index = pi
+
+            if page_index is None or not cell_bboxes:
+                table_stats["skipped_no_valid_page_or_bbox"] += 1
+                continue
+
+            bbox = _union_bbox(cell_bboxes)
+            if fitz.Rect(*bbox).get_area() < 5:
+                table_stats["skipped_tiny_area"] += 1
+                continue
+
+            items.append(
+                _ExtractItem(
+                    page_index=page_index,
+                    bbox=bbox,
+                    text=text,
+                    min_offset=_min_span_offset(getattr(cell, "spans", None) or []),
+                    spans=spans,
+                    source_kind="table_cell",
+                )
+            )
+            table_stats["added"] += 1
+            _log_every_five_extracted(items, verbose)
+
+    _print_skip_summary(verbose, "TABLE_CELLS", table_stats)
+
+    # -------------------------
+    # 2) LINE RUNS
+    # -------------------------
+    _vprint(verbose, f"[EXTRACT][LINE_RUNS] Extracting from DI pages[].lines[]")
+
+    def _word_span(w) -> Optional[Tuple[int, int]]:
+        sp = getattr(w, "span", None)
+        if sp is None:
+            return None
+        try:
+            o = int(sp.offset)
+            l = int(sp.length)
+            return (o, o + l)
+        except Exception:
+            return None
+
+    def _ranges_overlap_any(a: Tuple[int, int], ranges: List[Tuple[int, int]]) -> bool:
+        a0, a1 = a
+        for b0, b1 in ranges:
+            if _spans_overlap(a0, a1, b0, b1):
+                return True
+        return False
+
+    for page_obj in analyze_result.pages:
+        page_number_1 = getattr(page_obj, "page_number", None) or getattr(page_obj, "pageNumber", None)
+        if not page_number_1:
+            continue
+        page_index = int(page_number_1) - 1
+        if page_index < 0 or page_index >= doc.page_count:
+            continue
+
+        sx, sy = page_scale.get(page_index, (72.0, 72.0))
+
+        # build word list (scaled bboxes + span offsets)
+        word_items: List[Dict[str, Any]] = []
+        for w in (getattr(page_obj, "words", None) or []):
+            txt = (getattr(w, "content", "") or "").strip()
+            if not txt:
+                continue
+            sp = _word_span(w)
+            if not sp:
+                continue
+            bb = _poly_to_bbox(getattr(w, "polygon", None))
+            if not bb:
+                continue
+            bb = _scale_bbox(bb, sx, sy)
+            word_items.append(
+                {
+                    "text": txt,
+                    "bbox": bb,
+                    "span": sp,
+                    "h": (bb[3] - bb[1]),
+                }
+            )
+
+        lines = (getattr(page_obj, "lines", None) or [])
+        _vprint(verbose, f"[EXTRACT][LINE_RUNS] page={page_index}: lines={len(lines)} words={len(word_items)}")
+
+        for ln in lines:
+            line_stats["seen"] += 1
+            spans_ln = _span_ranges(getattr(ln, "spans", None) or [])
+            if spans_ln and table_cell_span_ranges and _any_overlap(spans_ln, table_cell_span_ranges):
+                line_stats["skipped_table_span_overlap"] += 1
+                continue
+
+            # select words whose spans overlap line spans
+            ln_words: List[Dict[str, Any]] = []
+            if spans_ln:
+                for wi in word_items:
+                    if _ranges_overlap_any(wi["span"], spans_ln):
+                        ln_words.append(wi)
+            else:
+                # no spans: fallback to line polygon + content as a single run
+                txt = (getattr(ln, "content", "") or "").strip()
+                if not txt:
+                    line_stats["skipped_empty_text"] += 1
+                    continue
+                bb = _poly_to_bbox(getattr(ln, "polygon", None))
+                if not bb:
+                    line_stats["skipped_no_valid_page_or_bbox"] += 1
+                    continue
+                bb = _scale_bbox(bb, sx, sy)
+                if fitz.Rect(*bb).get_area() < 5:
+                    line_stats["skipped_tiny_area"] += 1
+                    continue
+
+                items.append(
+                    _ExtractItem(
+                        page_index=page_index,
+                        bbox=bb,
+                        text=txt,
+                        min_offset=_min_span_offset(getattr(ln, "spans", None) or []),
+                        spans=spans_ln,
+                        source_kind="line_run",
+                    )
+                )
+                line_stats["added"] += 1
+                _log_every_five_extracted(items, verbose)
+                continue
+
+            if not ln_words:
+                line_stats["skipped_no_words_for_line"] += 1
+                continue
+
+            # sort left-to-right and split by big gaps
+            ln_words.sort(key=lambda z: z["bbox"][0])
+
+            heights = [w["h"] for w in ln_words if w["h"] > 0]
+            h_med = sorted(heights)[len(heights) // 2] if heights else 10.0
+            gap_thr = max(8.0, 2.2 * float(h_med)) # important for separating columns
+
+            run: List[Dict[str, Any]] = []
+            prev_x1: Optional[float] = None
+
+            def flush(run_words: List[Dict[str, Any]]) -> None:
+                if not run_words:
+                    return
+                txt = _join_words_preserve_punct([w["text"] for w in run_words])
+                if not txt:
+                    return
+                bb = _union_bbox([w["bbox"] for w in run_words])
+                if fitz.Rect(*bb).get_area() < 5:
+                    return
+
+                run_spans = [w["span"] for w in run_words if w.get("span")]
+                min_off = min((s[0] for s in run_spans), default=None)
+
+                # avoid duplicating table content
+                if run_spans and table_cell_span_ranges and _any_overlap(run_spans, table_cell_span_ranges):
+                    line_stats["skipped_table_span_overlap"] += 1
+                    return
+
+                items.append(
+                    _ExtractItem(
+                        page_index=page_index,
+                        bbox=bb,
+                        text=txt,
+                        min_offset=min_off,
+                        spans=run_spans,
+                        source_kind="line_run",
+                    )
+                )
+                line_stats["added"] += 1
+                _log_every_five_extracted(items, verbose)
+
+            for wi in ln_words:
+                x0, _y0, x1, _y1 = wi["bbox"]
+                if prev_x1 is not None and (x0 - prev_x1) > gap_thr:
+                    flush(run)
+                    run = []
+                run.append(wi)
+                prev_x1 = x1
+            flush(run)
+
+    _print_skip_summary(verbose, "LINE_RUNS", line_stats)
+
+    # -------------------------
+    # final reading order sort
+    # -------------------------
+    _vprint(verbose, f"[EXTRACT] Sorting {len(items)} extracted items into reading order")
+    items.sort(
+        key=lambda it: (
+            it.min_offset if it.min_offset is not None else 10**18,
+            it.page_index,
+            it.bbox[1],
+            it.bbox[0],
+        )
+    )
+
+    if verbose:
+        _vprint(verbose, "[EXTRACT] First 5 items after sort:")
+        for i, it in enumerate(items[:5], start=1):
+            _vprint(
+                verbose,
+                f"  #{i}: source={it.source_kind}, page={it.page_index}, bbox={_fmt_bbox(it.bbox)}, "
+                f"min_offset={it.min_offset}, text={_preview_text(it.text)}"
+            )
+        _vprint(verbose, f"[EXTRACT] Total extracted items: {len(items)}")
+
+    return items
+
+
+
+
+def _extract_blocks_from_docintel_result(
+    doc: fitz.Document,
+    analyze_result,
+    *,
+    verbose: bool = False,
+) -> List[BlockRef]:
+    """
+    Now extracts semantic units:
+        - table cells
+        - paragraphs (multi-line kept together by DI)
+    """
+    items = _extract_items_from_docintel_result(doc, analyze_result, verbose=verbose)
+    blocks = [BlockRef(page_index=it.page_index, bbox=it.bbox, text=it.text) for it in items]
+    _vprint(verbose, f"[EXTRACT] Converted extracted items -> BlockRef list (count={len(blocks)})")
+    return blocks
+
+
+def extract_all_blocks(pdf_bytes: bytes, *, verbose: bool = False) -> Tuple[fitz.Document, List[BlockRef]]:
+    """
+    Opens the PDF (for writing later) and extracts text blocks using Azure Document Intelligence.
+    Returns:
+        - open fitz doc (caller will write into it)
+        - extracted blocks list in fitz coordinate space
+    """
+    t0 = time.perf_counter()
+    _vprint(verbose, f"[PIPELINE][EXTRACT] Opening PDF bytes (size={len(pdf_bytes)} bytes)")
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    _vprint(verbose, f"[PIPELINE][EXTRACT] PDF opened: page_count={doc.page_count}")
+
+    if doc.is_encrypted:
+        doc.close()
+        raise ValueError("Encrypted PDFs are not supported in this starter example.")
+
+    client = _get_doc_int_client(verbose=verbose)
+    model_id = os.getenv(doc_int_model, "prebuilt-layout").strip() or "prebuilt-layout"
+    _vprint(verbose, f"[DOCINT] Using model_id={model_id!r}")
+
+    t_di_start = time.perf_counter()
+    _vprint(verbose, "[DOCINT] begin_analyze_document(...) starting")
+    poller = client.begin_analyze_document(
+        model_id=model_id,
+        body=io.BytesIO(pdf_bytes), # raw PDF bytes sent as a stream
+        content_type="application/pdf",
+    )
+    _vprint(verbose, "[DOCINT] Poller created; waiting for result()")
+    analyze_result = poller.result()
+    t_di_end = time.perf_counter()
+    _vprint(verbose, f"[DOCINT] analyze_result received in {t_di_end - t_di_start:.2f}s")
+
+    blocks = _extract_blocks_from_docintel_result(doc, analyze_result, verbose=verbose)
+    _vprint(verbose, f"[PIPELINE][EXTRACT] Completed extraction in {time.perf_counter() - t0:.2f}s (blocks={len(blocks)})")
+    return doc, blocks
+
+# -----------------------------
+# Apply (write) — keep this single-threaded
+# -----------------------------
+
+_FONT_CACHE_LOCK = threading.Lock()
+_FONT_BUFFER_CACHE: Dict[str, bytes] = {} # fontfile -> font buffer bytes
+_MEASURE_FONT_LOCK = threading.Lock()
+_MEASURE_FONT_CACHE: Dict[Tuple[str, Optional[str]], fitz.Font] = {}
+# Japanese + CJK detection
+_CJK_RE = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uFF66-\uFF9F]")
+_PAGE_SPAN_CACHE_LOCK = threading.Lock()
+_PAGE_SPAN_CACHE: Dict[int, List[Tuple[fitz.Rect, float, float]]] = {} # page_no -> (rect, size, weight)
+
+
+def _get_page_style_spans(page: fitz.Page, *, verbose: bool = False) -> List[Tuple[fitz.Rect, float, float]]:
+    """
+    Extract original text spans with font sizes from the PDF (before redaction).
+    Cached per page for speed.
+    """
+    pno = int(getattr(page, "number", 0))
+    with _PAGE_SPAN_CACHE_LOCK:
+        cached = _PAGE_SPAN_CACHE.get(pno)
+        if cached is not None:
+            return cached
+
+    d = page.get_text("dict") or {}
+    spans_out: List[Tuple[fitz.Rect, float, float]] = []
+    for b in d.get("blocks", []) or []:
+        for ln in b.get("lines", []) or []:
+            for sp in ln.get("spans", []) or []:
+                bbox = sp.get("bbox")
+                size = sp.get("size")
+                txt = sp.get("text", "") or ""
+                if not bbox or size is None:
+                    continue
+                try:
+                    r = fitz.Rect(bbox)
+                    sz = float(size)
+                except Exception:
+                    continue
+                if r.get_area() <= 0:
+                    continue
+                # weight: overlap area will dominate; multiply by text length to reduce noise
+                w = float(max(1, len(txt.strip())))
+                spans_out.append((r, sz, w))
+
+    with _PAGE_SPAN_CACHE_LOCK:
+        _PAGE_SPAN_CACHE[pno] = spans_out
+    _vprint(verbose, f"[STYLE] Cached {len(spans_out)} font spans for page {pno}")
+    return spans_out
+
+
+def _estimate_fontsize_for_rect(page: fitz.Page, rect: fitz.Rect, *, verbose: bool = False) -> Optional[float]:
+    """
+    Estimate the original font size inside rect by weighted median of intersecting spans.
+    """
+    spans = _get_page_style_spans(page, verbose=verbose)
+    cand: List[Tuple[float, float]] = [] # (size, weight)
+
+    for r, sz, w in spans:
+        inter = r & rect
+        if inter.is_empty:
+            continue
+        ia = inter.get_area()
+        if ia < 1.0:
+            continue
+        # require some meaningful overlap to avoid grabbing neighbors
+        if (ia / max(1.0, r.get_area())) < 0.12 and (ia / max(1.0, rect.get_area())) < 0.04:
+            continue
+        cand.append((sz, ia * w))
+
+    if not cand:
+        return None
+
+    cand.sort(key=lambda x: x[0])
+    total = sum(w for _, w in cand)
+    acc = 0.0
+    for sz, w in cand:
+        acc += w
+        if acc >= total / 2.0:
+            return math.floor(float(sz))
+    return math.floor(float(cand[-1][0]))
+
+
+def _guess_align_for_rect(page: fitz.Page, rect: fitz.Rect) -> int:
+    """
+    Heuristic alignment:
+        - center if near page center and not too wide (titles)
+        - right if in right column
+        - else left
+    """
+    pw = float(page.rect.width)
+    cx = (rect.x0 + rect.x1) / 2.0
+    if abs(cx - pw / 2.0) < pw * 0.08 and rect.width < pw * 0.75:
+        return fitz.TEXT_ALIGN_CENTER
+    if rect.x0 > pw * 0.55:
+        return fitz.TEXT_ALIGN_RIGHT
+    return fitz.TEXT_ALIGN_LEFT
+
+
+def _get_font_buffer(fontfile: str, *, verbose: bool = False) -> Optional[bytes]:
+    """
+    Load font file into a MuPDF font buffer (cached).
+    """
+    if not fontfile:
+        _vprint(verbose, "[FONT] _get_font_buffer called with empty fontfile")
+        return None
+    with _FONT_CACHE_LOCK:
+        buf = _FONT_BUFFER_CACHE.get(fontfile)
+        if buf is not None:
+            _vprint(verbose, f"[FONT] Font buffer cache hit: {fontfile}")
+            return buf
+
+        _vprint(verbose, f"[FONT] Loading font buffer from file: {fontfile}")
+        # build a MuPDF font and store its buffer (works well with page.insert_font(fontbuffer=...))
+        f = fitz.Font(fontfile=fontfile)
+        buf = f.buffer # bytes
+        _FONT_BUFFER_CACHE[fontfile] = buf
+        _vprint(verbose, f"[FONT] Cached font buffer: {fontfile} (bytes={len(buf) if buf else 0})")
+        return buf
+
+
+def _ensure_page_font(page: fitz.Page, fontname: str, fontfile: Optional[str], *, verbose: bool = False) -> None:
+    """
+    Ensure the given custom font is registered on this page using fontbuffer,
+    which improves CID embedding + ToUnicode mapping (copy/paste).
+    """
+    if not fontfile:
+        _vprint(verbose, f"[FONT] Page {page.number}: no custom fontfile for '{fontname}', using built-in font path")
+        return
+    try:
+        buf = _get_font_buffer(fontfile, verbose=verbose)
+        if not buf:
+            _vprint(verbose, f"[FONT] Page {page.number}: empty font buffer for '{fontname}'")
+            return
+        # set_simple=False forces non-simple font handling (important for CJK + Unicode)
+        page.insert_font(fontname=fontname, fontbuffer=buf, set_simple=False)
+        _vprint(verbose, f"[FONT] Registered font '{fontname}' on page {page.number} from file '{fontfile}'")
+    except Exception as e:
+        # best-effort; fallback path will still try with fontfile directly
+        _vprint(verbose, f"[FONT] Failed to register font '{fontname}' on page {page.number}: {e!r}")
+
+
+def _safe_rect(page: fitz.Page, rect: fitz.Rect, pad: float = 0.5) -> fitz.Rect:
+    r = fitz.Rect(rect)
+    r.x0 -= pad
+    r.y0 -= pad
+    r.x1 += pad
+    r.y1 += pad
+    r.intersect(page.rect)
+    return r
+
+
+def _sanitize_fontname(name: str) -> str:
+    # PDF fontnames should be short and ASCII-ish
+    base = re.sub(r"[^A-Za-z0-9_]+", "_", (name or "").strip())
+    base = re.sub(r"_+", "_", base).strip("_")
+    if not base:
+        base = "font"
+    return base[:40]
+
+
+def _looks_cjk(text: str) -> bool:
+    return bool(_CJK_RE.search(text or ""))
+
+
+def _pick_font(text: str, default_fontname: str, *, verbose: bool = False) -> Tuple[str, Optional[str]]:
+    """
+    Choose a font + fontfile. Returns (fontname, fontfile_or_None).
+
+    IMPORTANT:
+        - Return a deterministic fontname derived from font file name, not "cjk"/"uni".
+        - This allows us to register the font once per page and get correct Unicode mapping.
+    """
+    # universal font override (best for multi-language)
+    uni = (os.getenv("PDF_UNICODE_FONT_FILE", "") or "").strip()
+    if uni and os.path.exists(uni):
+        chosen = _sanitize_fontname(os.path.splitext(os.path.basename(uni))[0]), uni
+        _vprint(verbose, f"[FONT] Using PDF_UNICODE_FONT_FILE override: {chosen[1]}")
+        return chosen
+
+    if _looks_cjk(text):
+        _vprint(verbose, "[FONT] Detected CJK chars in text")
+        cjk = (os.getenv("PDF_CJK_FONT_FILE", "") or "").strip()
+        if cjk and os.path.exists(cjk):
+            _vprint(verbose, f"[FONT] Using CJK font from env PDF_CJK_FONT_FILE: {cjk}")
+            return _sanitize_fontname(os.path.splitext(os.path.basename(cjk))[0]), cjk
+
+        # common Windows JP fonts (best-effort)
+        win_candidates = [
+            r"C:\Windows\Fonts\meiryo.ttc",
+            r"C:\Windows\Fonts\msgothic.ttc",
+            r"C:\Windows\Fonts\YuGothR.ttc",
+            r"C:\Windows\Fonts\yugothic.ttf",
+            r"C:\Windows\Fonts\arialuni.ttf",
+        ]
+        for p in win_candidates:
+            if os.path.exists(p):
+                _vprint(verbose, f"[FONT] Using fallback Windows CJK font: {p}")
+                return _sanitize_fontname(os.path.splitext(os.path.basename(p))[0]), p
+
+        _vprint(verbose, f"[FONT] CJK text detected but no CJK font found; falling back to '{default_fontname}'")
+        return default_fontname, None
+
+    _vprint(verbose, f"[FONT] Non-CJK text; using default font '{default_fontname}'")
+    return default_fontname, None
+
+
+def _get_measure_font(fontname: str, fontfile: Optional[str], *, verbose: bool = False) -> fitz.Font:
+    """
+    Font used only for measuring text widths.
+    For custom fonts, measure using the same font file.
+    """
+    key = (fontname, fontfile)
+    with _MEASURE_FONT_LOCK:
+        f = _MEASURE_FONT_CACHE.get(key)
+        if f is not None:
+            _vprint(verbose, f"[FONT][MEASURE] Cache hit for {key}")
+            return f
+        if fontfile:
+            _vprint(verbose, f"[FONT][MEASURE] Loading measure font from file for {key}")
+            f = fitz.Font(fontfile=fontfile)
+        else:
+            _vprint(verbose, f"[FONT][MEASURE] Loading measure font by name for {key}")
+            f = fitz.Font(fontname=fontname) # Base14 like helv
+        _MEASURE_FONT_CACHE[key] = f
+        return f
+
+
+_ASCII_RUN_RE = re.compile(r"[A-Za-z0-9]+")
+def _wrap_text_to_width(
+    text: str,
+    font: fitz.Font,
+    fontsize: float,
+    max_width: float,
+    *,
+    cjk_mode: bool,
+) -> List[str]:
+    """
+    Produce explicit line breaks so that each line width <= max_width.
+    - For CJK: wrap by characters (with a small ASCII-run exception).
+    - For non-CJK: wrap by whitespace with fallback to char-wrap for very long tokens.
+    """
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    def w(s: str) -> float:
+        return float(font.text_length(s, fontsize=fontsize))
+
+    lines: List[str] = []
+    for para in text.split("\n"):
+        if not para.strip():
+            lines.append("") # preserve blank line
+            continue
+
+        if cjk_mode:
+            # tokenize: keep ASCII runs intact, otherwise per-character
+            tokens: List[str] = []
+            i = 0
+            while i < len(para):
+                m = _ASCII_RUN_RE.match(para, i)
+                if m:
+                    tokens.append(m.group(0))
+                    i = m.end()
+                    continue
+                tokens.append(para[i])
+                i += 1
+
+            cur = ""
+            for tok in tokens:
+                # avoid starting a line with spaces
+                if not cur and tok.isspace():
+                    continue
+                cand = cur + tok
+                if not cur or w(cand) <= max_width:
+                    cur = cand
+                else:
+                    lines.append(cur.rstrip())
+                    cur = tok.lstrip() if tok.isspace() else tok
+            if cur:
+                lines.append(cur.rstrip())
+        else:
+            # word wrap by whitespace; fallback to char wrap for very long words.
+            words = re.split(r"(\s+)", para) # keep spaces as tokens
+            cur = ""
+            for tok in words:
+                if tok == "":
+                    continue
+                if not cur and tok.isspace():
+                    continue
+                cand = cur + tok
+                if not cur or w(cand) <= max_width:
+                    cur = cand
+                    continue
+
+                # if token itself is too wide, break it
+                if w(tok) > max_width:
+                    if cur:
+                        lines.append(cur.rstrip())
+                        cur = ""
+                    # char-wrap the token
+                    buf = ""
+                    for ch in tok:
+                        cand2 = buf + ch
+                        if not buf or w(cand2) <= max_width:
+                            buf = cand2
+                        else:
+                            lines.append(buf.rstrip())
+                            buf = ch
+                    cur = buf
+                else:
+                    lines.append(cur.rstrip())
+                    cur = tok.lstrip() if tok.isspace() else tok
+            if cur:
+                lines.append(cur.rstrip())
+
+    # remove trailing empty lines created by splitting
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _truncate_lines_to_height(
+    lines: List[str],
+    font: fitz.Font,
+    fontsize: float,
+    max_width: float,
+    max_lines: int,
+) -> List[str]:
+    """
+    Ensure at most max_lines. If truncated, add ellipsis to last line.
+    """
+    if max_lines <= 0:
+        return []
+    if len(lines) <= max_lines:
+        return lines
+
+    out = lines[:max_lines]
+    last = out[-1]
+    ell = "…"
+    # shrink last line until it fits with ellipsis
+    while last and float(font.text_length(last + ell, fontsize=fontsize)) > max_width:
+        last = last[:-1]
+    out[-1] = (last + ell) if last else ell
+    return out
+
+
+def _fit_and_insert_textbox(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    *,
+    fontname: str,
+    fontfile: Optional[str],
+    start_fontsize: float,
+    min_fontsize: float = 5.0,
+    align: int = fitz.TEXT_ALIGN_LEFT,
+    verbose: bool = False,
+) -> bool:
+    """
+    Robust textbox insertion:
+        - Register font
+        - Wrap CJK ourselves (character wrap) so insert_textbox doesn't fail
+        - Try font sizes downwards until Shape.insert_textbox succeeds
+        - Final fallback: insert_text (never fails) with our pre-wrapped lines
+    """
+    t = (text or "").strip()
+    if not t:
+        _vprint(verbose, f"[APPLY][TEXTBOX] Empty text for rect={rect}; skipping insert")
+        return False
+
+    _ensure_page_font(page, fontname, fontfile, verbose=verbose)
+
+    # if font registration worked, we can use fontname-only;
+    # if it didn't, passing fontfile is a safe fallback
+    use_fontfile = None  # prefer registered font
+    mf = _get_measure_font(fontname, fontfile, verbose=verbose)
+    cjk_mode = _looks_cjk(t)
+
+    max_w = max(1.0, rect.width - 0.2)
+    print(f"Max width for text in rect (rect.width={rect.width}): {max_w:.2f}")
+    lineheight_factor = 1.19
+
+    fs = float(max(min_fontsize, start_fontsize))
+    attempt = 0
+
+    while fs >= min_fontsize - 1e-6:
+        if attempt > 25:
+            _vprint(verbose, f"[APPLY][TEXTBOX] Too many attempts for page={page.number}, rect={_fmt_bbox((rect.x0, rect.y0, rect.x1, rect.y1))}; giving up")
+            fs = 5.0 # safety break to avoid infinite loop
+            break
+        attempt += 1
+
+        # Wrap (NO truncation here)
+        raw_lines = _wrap_text_to_width(t, mf, fs, max_w, cjk_mode=cjk_mode)
+        wrapped = "\n".join(raw_lines).strip()
+
+        # fast path: if we obviously have too many lines for the available height, shrink fontsize more aggressively (avoiding lots of 0.5 steps)
+        max_lines_possible = max(1, int(rect.height / (fs * lineheight_factor)))
+        if len(raw_lines) > max_lines_possible:
+            # estimate next font size that could fit these lines (conservative)
+            fs_est = rect.height / (len(raw_lines) * lineheight_factor)
+            new_fs = max(min_fontsize, min(fs - 0.5, fs_est))
+            _vprint(
+                verbose,
+                f"[APPLY][TEXTBOX] page={page.number} attempt={attempt} fs={fs:.2f} "
+                f"lines={len(raw_lines)} > max_lines={max_lines_possible} so estimated font-size that fits: {fs_est}; shrinking -> {new_fs:.2f}"
+            )
+            fs = new_fs
+            continue
+
+        shape = page.new_shape()
+        try:
+            rc = shape.insert_textbox(
+                rect,
+                wrapped,
+                fontname=fontname,
+                fontfile=use_fontfile, # rely on registered font
+                fontsize=fs,
+                color=(0, 0, 0),
+                align=align,
+                lineheight=lineheight_factor,
+                set_simple=False,
+                encoding=0,
+            )
+        except Exception as e:
+            # fallback: try passing fontfile directly if fontname-only path fails
+            shape = page.new_shape()
+            rc = shape.insert_textbox(
+                rect,
+                wrapped,
+                fontname=fontname,
+                fontfile=fontfile,
+                fontsize=fs,
+                color=(0, 0, 0),
+                align=align,
+                lineheight=lineheight_factor,
+                set_simple=False,
+                encoding=0,
+            )
+            _vprint(verbose, f"[APPLY][TEXTBOX] fontname-only failed; retried with fontfile: {e!r}")
+
+        _vprint(
+            verbose,
+            f"[APPLY][TEXTBOX] page={page.number}, attempt={attempt}, fs={fs:.2f}, "
+            f"lines={len(raw_lines)}, rc={rc}, rect={_fmt_bbox((rect.x0, rect.y0, rect.x1, rect.y1))}",
+        )
+
+        if isinstance(rc, (int, float)) and rc >= 0:
+            shape.commit(overlay=True)
+            _vprint(verbose, f"[APPLY][TEXTBOX] success (page={page.number}, fs={fs:.2f})")
+            return True
+
+        fs -= 0.5
+
+    # ----- final fallback at min_fontsize: truncate to height -----
+    fs = float(min_fontsize)
+    max_lines = max(1, int(rect.height / (fs * lineheight_factor)))
+    raw_lines = _wrap_text_to_width(t, mf, fs, max_w, cjk_mode=cjk_mode)
+    lines = _truncate_lines_to_height(raw_lines, mf, fs, max_w, max_lines) # only truncate here
+    wrapped = "\n".join(lines).strip()
+
+    shape = page.new_shape()
+    rc = shape.insert_textbox(
+        rect,
+        wrapped,
+        fontname=fontname,
+        fontfile=use_fontfile,
+        fontsize=fs,
+        color=(0, 0, 0),
+        align=align,
+        lineheight=lineheight_factor,
+        set_simple=False,
+        encoding=0,
+    )
+    if isinstance(rc, (int, float)) and rc >= 0:
+        shape.commit(overlay=True)
+        _vprint(verbose, f"[APPLY][TEXTBOX] truncated fallback success (page={page.number}, fs={fs:.2f})")
+        return True
+
+    # worst-case: ensure *something* is visible
+    start_pt = fitz.Point(rect.x0, rect.y0 + fs)
+    shape = page.new_shape()
+    shape.insert_text(
+        start_pt,
+        lines,
+        fontname=fontname,
+        fontfile=use_fontfile,
+        fontsize=fs,
+        color=(0, 0, 0),
+        lineheight=lineheight_factor,
+        set_simple=False,
+        encoding=0,
+    )
+    shape.commit(overlay=True)
+    _vprint(verbose, f"[APPLY][TEXTBOX] insert_text worst-case fallback used (page={page.number})")
+    return True
+
+
+def apply_translations(
+    doc: fitz.Document,
+    translations: List[BlockTranslation],
+    *,
+    fontname: str = "helv",
+    fontsize: float = 11,
+    verbose: bool = False,
+) -> None:
+    """
+    Overlay mode, but with REAL removal of original text via redaction so selection works.
+        1) add redaction annots for all target rects on a page
+        2) apply redactions (removes underlying text)
+        3) insert translated text
+    """
+    by_page: Dict[int, List[BlockTranslation]] = {}
+    for t in translations:
+        by_page.setdefault(t.block.page_index, []).append(t)
+
+    _vprint(verbose, f"[APPLY] Grouped {len(translations)} translations into {len(by_page)} pages")
+
+    global_stats: Dict[str, int] = {
+        "seen_translations": 0,
+        "planned": 0,
+        "skipped_empty_output_and_original": 0,
+        "redactions_added": 0,
+        "insertions_attempted": 0,
+        "insertions_succeeded": 0,
+        "insertions_failed": 0,
+    }
+
+    for page_index, items in by_page.items():
+        page = doc[page_index]
+        _vprint(verbose, f"[APPLY][PAGE {page_index}] Processing {len(items)} translation blocks")
+
+        # prepare rects + outputs first
+        plans: List[Tuple[fitz.Rect, str, str, Optional[str], float]] = []
+        for item_idx, item in enumerate(items, start=1):
+            global_stats["seen_translations"] += 1
+
+            x0, y0, x1, y1 = item.block.bbox
+            rect = _safe_rect(page, fitz.Rect(x0, y0, x1, y1), pad=0.2) # smaller pad reduces collateral damage
+
+            out_text = (getattr(item, "translated_text", None) or "").strip()
+            if not out_text:
+                out_text = (item.block.text or "").strip()
+            if not out_text:
+                global_stats["skipped_empty_output_and_original"] += 1
+                _vprint(verbose, f"[APPLY][PAGE {page_index}] Item #{item_idx} skipped: empty translated+original text")
+                continue
+
+            eff_fontname, eff_fontfile = _pick_font(out_text, fontname, verbose=verbose)
+            _vprint(
+                verbose,
+                f"[APPLY][PAGE {page_index}] Plan #{item_idx}: "
+                f"src={_preview_text(item.block.text, 120)!r} -> out={_preview_text(out_text, 120)!r} | "
+                f"rect={_fmt_bbox((rect.x0, rect.y0, rect.x1, rect.y1))} | font='{eff_fontname}' file={eff_fontfile}"
+            )
+            orig_fs = _estimate_fontsize_for_rect(page, rect, verbose=verbose)
+            print(
+                f"[APPLY][PAGE {page_index}] Estimated original font size for item #{item_idx}: "
+                f"{_fmt_float(orig_fs)} if known, else default {fontsize}"
+            )
+            if orig_fs is None:
+                start_fs = min(float(fontsize), max(6.0, rect.height * 0.85))
+            else:
+                # keep it close to original, but clamp to bbox height
+                start_fs = float(orig_fs)
+                start_fs = min(start_fs, max(6.0, rect.height * 0.95))
+                start_fs = max(5.0, start_fs)
+
+            align_eff = _guess_align_for_rect(page, rect)
+
+            plans.append((rect, out_text, eff_fontname, eff_fontfile, start_fs, align_eff))
+            global_stats["planned"] += 1
+
+        if not plans:
+            _vprint(verbose, f"[APPLY][PAGE {page_index}] No plans after filtering; skipping page")
+            continue
+
+        # register all fonts used on this page once
+        seen_fonts = set()
+        for _rect, _out_text, fn, ff, _fs, _al in plans:
+            if ff and fn not in seen_fonts:
+                _ensure_page_font(page, fn, ff, verbose=verbose)
+                seen_fonts.add(fn)
+        _vprint(verbose, f"[APPLY][PAGE {page_index}] Registered {len(seen_fonts)} unique custom fonts")
+
+        # 1) add redactions
+        for rect, _out_text, _fn, _ff, _fs, _al in plans:
+            page.add_redact_annot(rect, fill=(1, 1, 1))
+            global_stats["redactions_added"] += 1
+        _vprint(verbose, f"[APPLY][PAGE {page_index}] Added {len(plans)} redaction annotations")
+
+        # 2) apply redactions ONCE per page (removes underlying text)
+        page.apply_redactions()
+        _vprint(verbose, f"[APPLY][PAGE {page_index}] Redactions applied")
+
+        # 3) insert translated text on top
+        for ins_idx, (rect, out_text, eff_fontname, eff_fontfile, start_fs, align_eff) in enumerate(plans, start=1):
+            ok = _fit_and_insert_textbox(
+                page,
+                rect,
+                out_text,
+                fontname=eff_fontname,
+                fontfile=eff_fontfile,
+                start_fontsize=start_fs,
+                min_fontsize=5.0,
+                align=align_eff,
+                verbose=verbose,
+            )
+            if ok:
+                global_stats["insertions_succeeded"] += 1
+            else:
+                global_stats["insertions_failed"] += 1
+                _vprint(verbose, f"[APPLY][PAGE {page_index}] Insertion #{ins_idx} failed")
+
+    if verbose:
+        print("[APPLY] Summary")
+        for k in sorted(global_stats.keys()):
+            print(f"  - {k}: {global_stats[k]}")
+
+
+def _normalize_translate_blocks_result(result) -> Tuple[List[BlockTranslation], Dict[str, Any]]:
+    """
+    Accept multiple return shapes from translation_service.translate_blocks without breaking compatibility:
+        - List[BlockTranslation]
+        - (translations, diagnostics_dict)
+        - {"translations": [...], "diagnostics": {...}}
+    """
+    diagnostics: Dict[str, Any] = {}
+
+    if isinstance(result, tuple) and len(result) >= 1:
+        translations = result[0]
+        if len(result) >= 2 and isinstance(result[1], dict):
+            diagnostics = result[1]
+        return translations, diagnostics
+
+    if isinstance(result, dict):
+        translations = result.get("translations", [])
+        diagnostics = result.get("diagnostics", {}) or {}
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        return translations, diagnostics
+
+    return result, diagnostics
+
+
+def _translate_blocks_with_optional_diagnostics(
+    blocks: List[BlockRef],
+    *,
+    verbose: bool = False,
+) -> Tuple[List[BlockTranslation], Dict[str, Any]]:
+    """
+    Calls translation_service.translate_blocks in a backward-compatible way.
+    If the service supports debug kwargs, we pass them; otherwise we fall back silently.
+    """
+    # rich diagnostics
+    try:
+        sig = inspect.signature(translate_blocks)
+        params = sig.parameters
+    except Exception:
+        params = {}
+
+    kwargs_candidates: List[Dict[str, Any]] = []
+    if params:
+        kw: Dict[str, Any] = {}
+        if "verbose" in params:
+            kw["verbose"] = verbose
+        if "return_diagnostics" in params:
+            kw["return_diagnostics"] = True
+        if "with_diagnostics" in params:
+            kw["with_diagnostics"] = True
+        if "debug" in params:
+            kw["debug"] = verbose
+        if "log_every_n" in params:
+            kw["log_every_n"] = 5
+        kwargs_candidates.append(kw)
+
+    # fallbacks
+    kwargs_candidates.extend([
+        {}, # classic call
+    ])
+
+    last_exc: Optional[Exception] = None
+    tried = set()
+    for kw in kwargs_candidates:
+        key = tuple(sorted(kw.items()))
+        if key in tried:
+            continue
+        tried.add(key)
+        try:
+            _vprint(verbose, f"[TRANSLATE] Calling translate_blocks with kwargs={kw}")
+            raw = translate_blocks(blocks, **kw)
+            translations, diagnostics = _normalize_translate_blocks_result(raw)
+            if not isinstance(diagnostics, dict):
+                diagnostics = {}
+            _vprint(
+                verbose,
+                f"[TRANSLATE] translate_blocks returned {len(translations) if hasattr(translations, '__len__') else 'unknown'} items; "
+                f"diagnostics_keys={list(diagnostics.keys()) if isinstance(diagnostics, dict) else []}"
+            )
+            return translations, diagnostics
+        except TypeError as e:
+            last_exc = e
+            _vprint(verbose, f"[TRANSLATE] translate_blocks call failed with kwargs={kw}: {e!r}; trying fallback")
+            continue
+
+    # final bare call (if all else fails / non-TypeError cases)
+    if last_exc is not None:
+        _vprint(verbose, f"[TRANSLATE] Falling back to bare translate_blocks(blocks) after TypeError attempts")
+    raw = translate_blocks(blocks)
+    translations, diagnostics = _normalize_translate_blocks_result(raw)
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    return translations, diagnostics
+
+
+def translate_pdf_bytes_pipeline(pdf_bytes: bytes, *, verbose: bool = False) -> bytes:
+    total_t0 = time.perf_counter()
+    extraction_time = translation_time = apply_time = save_time = 0.0
+    diagnostics: Dict[str, Any] = {}
+    errors = 0
+
+    _vprint(verbose, "[PIPELINE] Starting PDF Translation pipeline...")
+    _vprint(verbose, "[PIPELINE] Extracting blocks with Azure Document Intelligence...")
+
+    t0 = time.perf_counter()
+    doc, blocks = extract_all_blocks(pdf_bytes, verbose=verbose)
+    extraction_time = time.perf_counter() - t0
+    _vprint(verbose, f"[PIPELINE] Extracted {len(blocks)} blocks in {extraction_time:.2f}s. Translating...")
+
+    try:
+        t1 = time.perf_counter()
+        # PoC: translation_service handles the 3-stage pipeline - wrapped with optional diagnostics
+        translations, diagnostics = _translate_blocks_with_optional_diagnostics(blocks, verbose=verbose)
+        translation_time = time.perf_counter() - t1
+
+        _vprint(verbose, f"[PIPELINE] Translations obtained: {len(translations)} items in {translation_time:.2f}s")
+        if len(translations) != len(blocks):
+            _vprint(
+                verbose,
+                f"[PIPELINE][WARN] Translation count ({len(translations)}) != extracted block count ({len(blocks)}). "
+                "This may be expected if translation_service filters/merges blocks."
+            )
+
+        _print_translation_samples(blocks, translations, diagnostics, verbose=verbose)
+
+        _vprint(verbose, "[PIPELINE] Applying translations to PDF...")
+        t2 = time.perf_counter()
+        apply_translations(doc, translations, verbose=verbose)
+        apply_time = time.perf_counter() - t2
+        _vprint(verbose, f"[PIPELINE] Applied translations in {apply_time:.2f}s. Saving PDF...")
+
+        t3 = time.perf_counter()
+        out_bytes = doc.tobytes(deflate=True, garbage=4)
+        save_time = time.perf_counter() - t3
+        _vprint(verbose, f"[PIPELINE] Saved PDF bytes in {save_time:.2f}s (size={len(out_bytes)} bytes)")
+
+        total_time = time.perf_counter() - total_t0
+        _print_timing_report(
+            verbose=verbose,
+            chunks_processed=len(blocks),
+            extraction_time=extraction_time,
+            translation_time=translation_time,
+            apply_time=apply_time,
+            save_time=save_time,
+            total_time=total_time,
+            diagnostics=diagnostics,
+            errors=errors,
+        )
+        return out_bytes
+
+    except Exception:
+        errors += 1
+        total_time = time.perf_counter() - total_t0
+        _print_timing_report(
+            verbose=verbose,
+            chunks_processed=len(blocks) if 'blocks' in locals() else 0,
+            extraction_time=extraction_time,
+            translation_time=translation_time,
+            apply_time=apply_time,
+            save_time=save_time,
+            total_time=total_time,
+            diagnostics=diagnostics,
+            errors=errors,
+        )
+        raise
+    finally:
+        doc.close()
+        _vprint(verbose, "[PIPELINE] Pipeline completed! (doc closed)")
+
+
+if __name__ == "__main__":
+    path = r"C:\Users\AdityaPathak\Downloads\AdityaPathak_Jan2026 - Copy.pdf"
+    with open(path, "rb") as f:
+        pdf_bytes = f.read()
+
+    # toggle verbose logs here for local runs
+    verbose = True
+
+    doc, blocks = extract_all_blocks(pdf_bytes, verbose=verbose)
+    try:
+        print(f"Extracted blocks: {len(blocks)}")
+        for b in blocks[:80]:
+            print(f"[p{b.page_index}] {b.bbox} :: {b.text}")
+    finally:
+        doc.close()
+
+
+
+
+### DEAD CODE: old paragraph-level extraction (replaced by line-level extraction for better fidelity and control)
+
+# def _extract_items_from_docintel_result(doc: fitz.Document, analyze_result, *, verbose: bool = False) -> List[_ExtractItem]: ### paragraph level extraction
+#     """
+#     Extract semantic translation units:
+#         - table cells (from analyze_result.tables[].cells[])
+#         - paragraphs (from analyze_result.paragraphs[])
+#     Paragraphs overlapping table-cell spans are skipped to avoid duplication.
+#     """
+#     items: List[_ExtractItem] = []
+
+#     if not getattr(analyze_result, "pages", None):
+#         _vprint(verbose, "[EXTRACT] analyze_result.pages is empty; nothing to extract")
+#         return items
+
+#     # precompute per-page scale factors (DI -> fitz)
+#     page_scale: Dict[int, Tuple[float, float]] = {}
+#     _vprint(verbose, f"[EXTRACT] Computing page scale factors for {len(analyze_result.pages)} DI pages")
+#     for page_obj in analyze_result.pages:
+#         page_number_1 = getattr(page_obj, "page_number", None) or getattr(page_obj, "pageNumber", None)
+#         if not page_number_1:
+#             _vprint(verbose, "[EXTRACT][PAGE-SCALE] Skipping DI page without page_number")
+#             continue
+#         page_index = int(page_number_1) - 1
+#         if page_index < 0 or page_index >= doc.page_count:
+#             _vprint(verbose, f"[EXTRACT][PAGE-SCALE] Skipping DI page_number={page_number_1}; out of fitz range")
+#             continue
+
+#         fitz_page = doc[page_index]
+#         fitz_w = float(fitz_page.rect.width)
+#         fitz_h = float(fitz_page.rect.height)
+
+#         di_w = float(getattr(page_obj, "width", 0.0) or 0.0)
+#         di_h = float(getattr(page_obj, "height", 0.0) or 0.0)
+
+#         if di_w <= 0 or di_h <= 0:
+#             sx = sy = 72.0
+#             _vprint(verbose, f"[EXTRACT][PAGE-SCALE] p{page_index}: missing DI dimensions, fallback sx=sy=72.0")
+#         else:
+#             sx = fitz_w / di_w
+#             sy = fitz_h / di_h
+#             _vprint(
+#                 verbose,
+#                 f"[EXTRACT][PAGE-SCALE] p{page_index}: DI({di_w:.3f}x{di_h:.3f}) -> "
+#                 f"PDF({fitz_w:.3f}x{fitz_h:.3f}) => sx={sx:.6f}, sy={sy:.6f}",
+#             )
+
+#         page_scale[page_index] = (sx, sy)
+
+#     table_stats: Dict[str, int] = {
+#         "seen": 0,
+#         "added": 0,
+#         "skipped_empty_text": 0,
+#         "skipped_no_valid_page_or_bbox": 0,
+#         "skipped_tiny_area": 0,
+#     }
+#     para_stats: Dict[str, int] = {
+#         "seen": 0,
+#         "added": 0,
+#         "skipped_empty_text": 0,
+#         "skipped_table_span_overlap": 0,
+#         "skipped_no_valid_page_or_bbox": 0,
+#         "skipped_tiny_area": 0,
+#     }
+
+#     # --- 1) TABLE CELLS ---
+#     table_cell_span_ranges: List[Tuple[int, int]] = []
+#     all_tables = (getattr(analyze_result, "tables", None) or [])
+#     _vprint(verbose, f"[EXTRACT][TABLE_CELLS] DI tables found: {len(all_tables)}")
+
+#     for ti, table in enumerate(all_tables, start=1):
+#         cells = (getattr(table, "cells", None) or [])
+#         _vprint(verbose, f"[EXTRACT][TABLE_CELLS] Table #{ti}: cells={len(cells)}")
+#         for ci, cell in enumerate(cells, start=1):
+#             table_stats["seen"] += 1
+
+#             text = (getattr(cell, "content", "") or "").strip()
+#             if not text:
+#                 table_stats["skipped_empty_text"] += 1
+#                 continue
+
+#             spans = _span_ranges(getattr(cell, "spans", None) or [])
+#             if spans:
+#                 table_cell_span_ranges.extend(spans)
+
+#             brs = getattr(cell, "bounding_regions", None) or []
+#             # A cell can have multiple bounding regions; union them (usually 1)
+#             cell_bboxes: List[Tuple[float, float, float, float]] = []
+#             page_index: Optional[int] = None
+
+#             for br in brs:
+#                 pno = getattr(br, "page_number", None) or getattr(br, "pageNumber", None)
+#                 if not pno:
+#                     continue
+#                 pi = int(pno) - 1
+#                 if pi < 0 or pi >= doc.page_count:
+#                     continue
+#                 poly = getattr(br, "polygon", None)
+#                 bb = _poly_to_bbox(poly)
+#                 if not bb:
+#                     continue
+#                 sx, sy = page_scale.get(pi, (72.0, 72.0))
+#                 bb = _scale_bbox(bb, sx, sy)
+#                 cell_bboxes.append(bb)
+#                 page_index = pi
+
+#             if page_index is None or not cell_bboxes:
+#                 table_stats["skipped_no_valid_page_or_bbox"] += 1
+#                 if verbose and ci % 25 == 0:
+#                     _vprint(verbose, f"[EXTRACT][TABLE_CELLS] Table #{ti} cell #{ci}: skipped (no valid page/bbox)")
+#                 continue
+
+#             bbox = _union_bbox(cell_bboxes)
+#             if fitz.Rect(*bbox).get_area() < 5:
+#                 table_stats["skipped_tiny_area"] += 1
+#                 continue
+
+#             items.append(
+#                 _ExtractItem(
+#                     page_index=page_index,
+#                     bbox=bbox,
+#                     text=text,
+#                     min_offset=_min_span_offset(getattr(cell, "spans", None) or []),
+#                     spans=spans,
+#                     source_kind="table_cell",
+#                 )
+#             )
+#             table_stats["added"] += 1
+#             _log_every_five_extracted(items, verbose)
+
+#     _print_skip_summary(verbose, "TABLE_CELLS", table_stats)
+
+#     # --- 2) PARAGRAPHS (skip those that overlap table spans) ---
+#     paragraphs = (getattr(analyze_result, "paragraphs", None) or [])
+#     _vprint(verbose, f"[EXTRACT][PARAGRAPHS] DI paragraphs found: {len(paragraphs)}")
+
+#     for pi_idx, para in enumerate(paragraphs, start=1):
+#         para_stats["seen"] += 1
+
+#         text = (getattr(para, "content", "") or "").strip()
+#         if not text:
+#             para_stats["skipped_empty_text"] += 1
+#             continue
+
+#         spans = _span_ranges(getattr(para, "spans", None) or [])
+#         if spans and table_cell_span_ranges and _any_overlap(spans, table_cell_span_ranges):
+#             # avoid duplicating table text (cells already extracted)
+#             para_stats["skipped_table_span_overlap"] += 1
+#             continue
+
+#         brs = getattr(para, "bounding_regions", None) or []
+#         para_bboxes: List[Tuple[float, float, float, float]] = []
+#         page_index: Optional[int] = None
+
+#         for br in brs:
+#             pno = getattr(br, "page_number", None) or getattr(br, "pageNumber", None)
+#             if not pno:
+#                 continue
+#             pi = int(pno) - 1
+#             if pi < 0 or pi >= doc.page_count:
+#                 continue
+#             poly = getattr(br, "polygon", None)
+#             bb = _poly_to_bbox(poly)
+#             if not bb:
+#                 continue
+#             sx, sy = page_scale.get(pi, (72.0, 72.0))
+#             bb = _scale_bbox(bb, sx, sy)
+#             para_bboxes.append(bb)
+#             page_index = pi
+
+#         if page_index is None or not para_bboxes:
+#             para_stats["skipped_no_valid_page_or_bbox"] += 1
+#             if verbose and pi_idx % 50 == 0:
+#                 _vprint(verbose, f"[EXTRACT][PARAGRAPHS] Paragraph #{pi_idx}: skipped (no valid page/bbox)")
+#             continue
+
+#         bbox = _union_bbox(para_bboxes)
+#         if fitz.Rect(*bbox).get_area() < 5:
+#             para_stats["skipped_tiny_area"] += 1
+#             continue
+
+#         items.append(
+#             _ExtractItem(
+#                 page_index=page_index,
+#                 bbox=bbox,
+#                 text=text,
+#                 min_offset=_min_span_offset(getattr(para, "spans", None) or []),
+#                 spans=spans,
+#                 source_kind="paragraph",
+#             )
+#         )
+#         para_stats["added"] += 1
+#         _log_every_five_extracted(items, verbose)
+
+#     _print_skip_summary(verbose, "PARAGRAPHS", para_stats)
+
+#     # Sort best-effort reading order:
+#     # 1) by min span offset (global reading order)
+#     # 2) fallback geometry
+#     _vprint(verbose, f"[EXTRACT] Sorting {len(items)} extracted items into reading order")
+#     items.sort(
+#         key=lambda it: (
+#             it.min_offset if it.min_offset is not None else 10**18,
+#             it.page_index,
+#             it.bbox[1],
+#             it.bbox[0],
+#         )
+#     )
+
+#     if verbose:
+#         _vprint(verbose, "[EXTRACT] First 5 items after sort:")
+#         for i, it in enumerate(items[:5], start=1):
+#             _vprint(
+#                 verbose,
+#                 f"  #{i}: source={it.source_kind}, page={it.page_index}, bbox={_fmt_bbox(it.bbox)}, "
+#                 f"min_offset={it.min_offset}, text={_preview_text(it.text)}"
+#             )
+#         _vprint(verbose, f"[EXTRACT] Total extracted items: {len(items)}")
+
+#     return items
