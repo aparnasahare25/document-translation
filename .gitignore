@@ -1,5 +1,11 @@
+# Folders
+data/
+extra/
+output/
+
 # Environment / secrets
 .env
 
 # OS
 .DS_Store
+/backend/scripts/__pycache__
