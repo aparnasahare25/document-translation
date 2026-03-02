@@ -1,4 +1,11 @@
+# Folders
+data/
+extra/
+output/
+
+# Environment / secrets
 .env
 .venv/
 .DS_Store
 __pycache__/
+/backend/scripts/__pycache__
