@@ -8,20 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.glossary_retrieval.refine_with_glossary import refine_segment_with_glossary
 
 
-# -----------------------------
-# Data models
-# -----------------------------
-@dataclass(frozen=True)
-class BlockRef:
-    page_index: int
-    bbox: Tuple[float, float, float, float]
-    text: str
-
-
-@dataclass(frozen=True)
-class BlockTranslation:
-    block: BlockRef
-    translated_text: str
+from services.layout.containers import ContainerRef, ContainerTranslation
 
 
 # -----------------------------
@@ -222,28 +209,78 @@ def _llm1_refine(
     context_prev_10: List[Dict[str, str]],
     source_lang: str,
     target_lang: str,
+    is_placeholder: bool = False,
+    is_short_mode: bool = False,
+    kind: Optional[str] = None,
+    paragraph_context: Optional[List[str]] = None,  # sibling lines in same paragraph
 ) -> str:
-    system = (
-        f"You are a professional technical translator and editor ({source_lang.upper()} -> {target_lang.upper()}).\n"
-        "Task: Improve the provided machine translation so it is grammatically correct, fluent, and faithful.\n"
-        "Rules:\n"
-        " - Preserve meaning exactly.\n"
-        " - Preserve numbers, units, codes, part numbers, and tokens like [[...]] exactly.\n"
-        " - Do not add extra commentary.\n"
-        "Output JSON with key: translation\n"
-    )
+    system_lines = [
+        f"You are a professional technical translator and editor ({source_lang.upper()} -> {target_lang.upper()}).",
+        "Task: Improve the provided machine translation so it is grammatically correct, fluent, and faithful.",
+        "Rules:",
+        " - Preserve meaning exactly.",
+        " - Preserve numbers, units, codes, part numbers, and tokens like [[...]] exactly.",
+        " - Do not add extra commentary or chat.",
+    ]
+    
+    # Kind-aware specific instructions (Step 8.3/7.3)
+    if kind == "TABLE_CELL":
+        system_lines.append(" - CONTEXT: This is a table cell. Keep it professional and avoid leading/trailing punctuation if not present in source.")
+    elif kind == "HEADER_FOOTER":
+        system_lines.append(" - CONTEXT: This is a header or footer. Keep it brief and formal.")
+    elif kind == "LABEL":
+        system_lines.append(" - CONTEXT: This is a short label inside a diagram or UI. Conciseness is CRITICAL.")
+
+    if is_short_mode:
+        system_lines.append(" - SHORT MODE ACTIVE: Perform a 'lossy' grammar compression: remove articles (the, a, is), use abbreviations, and provide the shortest valid translation variant that fits in tight space.")
+    
+    system_lines.append("Output JSON with key: translation")
+    
+    system = "\n".join(system_lines)
 
     payload = {
         "source_lang": _norm_lang(source_lang),
         "target_lang": _norm_lang(target_lang),
-        "previous_context": context_prev_10, # list of {"src":..., "mt":...}
+        "previous_context": context_prev_10,
         "source": source_text,
         "machine_translation": mt_text,
         "instructions": "Return only JSON.",
     }
 
-    out = aoai.chat_json(system, payload, temperature=0.2, max_tokens=900)
-    cand = (out.get("translation") or "").strip()
+    if kind:
+        payload["container_kind"] = kind
+
+    # Paragraph context: sibling lines that belong to the same paragraph group.
+    # Gives the LLM full-sentence context for grammar quality even though each line
+    # is translated and placed individually.
+    if paragraph_context:
+        payload["paragraph_context"] = paragraph_context
+
+    cand = mt_text
+    # 7.2: Auto-repair/re-run with stricter constraints
+    max_retries = 3 if is_placeholder else 2
+    
+    for attempt in range(max_retries):
+        try:
+            out = aoai.chat_json(system, payload, temperature=0.1, max_tokens=900)
+            curr_cand = (out.get("translation") or "").strip()
+            
+            if not curr_cand:
+                continue
+                
+            if is_placeholder and not _preserves_placeholders(curr_cand, source_text):
+                # 7.2 Stricter constraint retry
+                payload["instructions"] = "FATAL ERROR: You dropped or corrupted mandatory [[...]] placeholders. YOU MUST PRESERVE THEM EXACTLY. Re-try now."
+                payload["temperature"] = 0.0 # Force determinism on retry
+                continue
+            
+            cand = curr_cand
+            break
+        except Exception:
+            if attempt == max_retries - 1:
+                break
+            time.sleep(0.5)
+
     return cand if cand else mt_text
 
 
@@ -251,7 +288,7 @@ def _llm1_refine(
 # Public API: translate_blocks
 # -----------------------------
 def translate_blocks(
-    blocks: List[BlockRef],
+    blocks: List[ContainerRef],
     *,
     source_lang: Optional[str] = None,
     target_lang: Optional[str] = None,
@@ -262,7 +299,7 @@ def translate_blocks(
     with_diagnostics: bool = False,
     debug: Optional[bool] = None,
     log_every_n: int = 5,
-) -> Union[List[BlockTranslation], Tuple[List[BlockTranslation], Dict[str, Any]]]:
+) -> Union[List[ContainerTranslation], Tuple[List[ContainerTranslation], Dict[str, Any]]]:
     """
     Three-step pipeline (no cache):
         1) Azure Translator (baseline MT)
@@ -439,9 +476,17 @@ def translate_blocks(
     )
 
     # -------------------------
-    # Stage 2: LLM1 (parallel; context is previous 10 src+mt)
+    # Stage 2: LLM1 (parallel; context is previous 10 src+mt + paragraph group)
     # -------------------------
     pass1: List[str] = list(mt_out)
+
+    # Build paragraph group map: group_id -> list of (index, source_text)
+    # Used to construct paragraph_context for LLM1 without merging bboxes.
+    group_map: Dict[str, List[int]] = {}
+    for i, b in enumerate(blocks):
+        gid = getattr(b, "paragraph_group_id", None)
+        if gid:
+            group_map.setdefault(gid, []).append(i)
 
     # store per-index info to create deterministic "1 in 5" samples later.
     llm1_debug_by_index: Dict[int, Dict[str, str]] = {}
@@ -452,6 +497,7 @@ def translate_blocks(
         if skip_mask[i]:
             return i, src_texts[i], (time.perf_counter() - t0)
 
+        # Rolling 10-chunk context (cross-paragraph continuity)
         ctx: List[Dict[str, str]] = []
         start = max(0, i - 10)
         for j in range(start, i):
@@ -462,8 +508,20 @@ def translate_blocks(
         if not src or _should_skip_translation(src):
             return i, src_texts[i], (time.perf_counter() - t0)
 
-        # placeholder safety
+        # Paragraph context: sibling source lines in the same group (for grammar coherence).
+        # Excludes the current line itself; preserves reading order.
+        para_ctx: Optional[List[str]] = None
+        gid = getattr(blocks[i], "paragraph_group_id", None)
+        if gid and gid in group_map:
+            siblings = group_map[gid]
+            if len(siblings) > 1:
+                para_ctx = [src_texts[j] for j in siblings if j != i]
+
+        # placeholder/short mode detection
         is_placeholder = ("[[BLOCK" in src) or ("[[INLINE" in src) or bool(_extract_placeholders(src))
+
+        kind_val = blocks[i].kind.value if hasattr(blocks[i].kind, "value") else str(blocks[i].kind)
+        is_short_mode = (kind_val == "LABEL")
 
         try:
             refined = _llm1_refine(
@@ -473,6 +531,10 @@ def translate_blocks(
                 context_prev_10=ctx,
                 source_lang=source_lang,
                 target_lang=target_lang,
+                is_placeholder=is_placeholder,
+                is_short_mode=is_short_mode,
+                kind=kind_val,
+                paragraph_context=para_ctx,
             )
             if is_placeholder and not _preserves_placeholders(refined, src):
                 # fallback to MT or source
@@ -550,6 +612,9 @@ def translate_blocks(
             return i, src_texts[i], (time.perf_counter() - t0)
 
         is_placeholder = ("[[BLOCK" in src) or ("[[INLINE" in src) or bool(_extract_placeholders(src))
+        
+        kind_val = blocks[i].kind.value if hasattr(blocks[i].kind, "value") else str(blocks[i].kind)
+        is_short_mode = (kind_val == "LABEL")
 
         # OPTIONAL: can use prev 10 pass1 chunks as extra context inside your refine function
         try:
@@ -560,7 +625,8 @@ def translate_blocks(
                 verbose=eff_verbose, # use effective verbose, not env-only VERBOSE
                 top_k_paragraphs=top_k_paragraphs,
                 source_lang=source_lang,
-                target_lang=target_lang
+                target_lang=target_lang,
+                is_short_mode=is_short_mode,
             )
             if is_placeholder and not _preserves_placeholders(refined, src):
                 refined = cur
@@ -612,11 +678,11 @@ def translate_blocks(
     timings["translate_blocks_wall"] = time.perf_counter() - t_pipeline_start
 
     # -------------------------
-    # Return BlockTranslation list in original order
+    # Return ContainerTranslation list in original order
     # -------------------------
-    out: List[BlockTranslation] = []
+    out: List[ContainerTranslation] = []
     for i, b in enumerate(blocks):
-        out.append(BlockTranslation(block=b, translated_text=final_out[i]))
+        out.append(ContainerTranslation(container=b, translated_text=final_out[i]))
 
     # deterministic LLM1 sample list in original order (wrapper will print 1 in 5)
     llm1_pairs: List[Dict[str, Any]] = []

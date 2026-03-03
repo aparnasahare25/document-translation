@@ -9,7 +9,27 @@ import os, fitz, io, re, threading, time, inspect, math # PyMuPDF (used for writ
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 
+from services.layout.extractor import build_containers
 from services.translation_service import translate_blocks
+from services.layout.typesetter import typeset_and_insert
+from services.layout.classifier import classify_container
+from services.layout.containers import (
+    ContainerRef,
+    ContainerKind,
+    TranslationPlan,
+    RenderingIntent,
+    TranslationPolicy,
+    ContainerTranslation,
+)
+from services.layout.geometry import (
+    poly_to_bbox as _poly_to_bbox,
+    scale_bbox as _scale_bbox,
+    scale_poly as _scale_poly,
+    union_bbox as _union_bbox,
+    bbox_overlap_area as _bbox_overlap_area,
+    bbox_area as _bbox_area,
+)
+from services.text_normalization.normalizer import apply_normalization_pipeline, restore_protected_tokens
 
 
 # -----------------------------
@@ -101,8 +121,8 @@ def _diag_lookup(diag: Dict[str, Any], *keys, default=None):
 
 
 def _print_translation_samples(
-    blocks: List["BlockRef"],
-    translations: List["BlockTranslation"],
+    blocks: List[ContainerRef],
+    translations: List[TranslationPlan],
     diagnostics: Dict[str, Any],
     *,
     verbose: bool,
@@ -133,8 +153,8 @@ def _print_translation_samples(
     for i, bt in enumerate(translations, start=1):
         if i % 5 != 0:
             continue
-        print(f"  [Final sample #{i}] original  : {_preview_text(bt.block.text, 180)}")
-        print(f"  [Final sample #{i}] translated: {_preview_text(bt.translated_text, 180)}")
+        print(f"  [Final sample #{i}] original  : {_preview_text(bt.container.text, 180)}")
+        print(f"  [Final sample #{i}] translated: {_preview_text(bt.final_rendered_text, 180)}")
 
 
 def _fmt_float(x: Optional[float], nd: int = 2) -> str:
@@ -265,55 +285,7 @@ def _join_words_preserve_punct(words: List[str]) -> str:
     return s
 
 
-def _poly_to_bbox(poly) -> Optional[Tuple[float, float, float, float]]:
-    """
-    Accepts either:
-        - [x0,y0, x1,y1, x2,y2, x3,y3] (flat float list)
-        - [{x:..., y:...}, ...] or objects with .x/.y
-    Returns bbox (x0,y0,x1,y1) in the same unit as polygon.
-    """
-    if not poly:
-        return None
-
-    # flat list [x0,y0,x1,y1,...]
-    if isinstance(poly, list) and poly and isinstance(poly[0], (int, float)):
-        if len(poly) < 8:
-            return None
-        xs = poly[0::2]
-        ys = poly[1::2]
-        return (min(xs), min(ys), max(xs), max(ys))
-
-    # list of points
-    xs: List[float] = []
-    ys: List[float] = []
-    try:
-        for p in poly:
-            if isinstance(p, dict):
-                xs.append(float(p.get("x")))
-                ys.append(float(p.get("y")))
-            else:
-                xs.append(float(getattr(p, "x")))
-                ys.append(float(getattr(p, "y")))
-        if not xs or not ys:
-            return None
-        return (min(xs), min(ys), max(xs), max(ys))
-    except Exception:
-        return None
-
-
-def _scale_bbox(bbox: Tuple[float, float, float, float], sx: float, sy: float) -> Tuple[float, float, float, float]:
-    x0, y0, x1, y1 = bbox
-    return (x0 * sx, y0 * sy, x1 * sx, y1 * sy)
-
-
-def _union_bbox(bboxes: List[Tuple[float, float, float, float]]) -> Tuple[float, float, float, float]:
-    x0 = min(b[0] for b in bboxes)
-    y0 = min(b[1] for b in bboxes)
-    x1 = max(b[2] for b in bboxes)
-    y1 = max(b[3] for b in bboxes)
-    return (x0, y0, x1, y1)
-
-
+# Using shared helpers from geometry.py via imports above.
 def _spans_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
     return not (a1 <= b0 or b1 <= a0)
 
@@ -672,8 +644,6 @@ def _extract_items_from_docintel_result(doc: fitz.Document, analyze_result, *, v
     return items
 
 
-
-
 def _extract_blocks_from_docintel_result(
     doc: fitz.Document,
     analyze_result,
@@ -691,12 +661,13 @@ def _extract_blocks_from_docintel_result(
     return blocks
 
 
-def extract_all_blocks(pdf_bytes: bytes, *, verbose: bool = False) -> Tuple[fitz.Document, List[BlockRef]]:
+def extract_all_blocks(pdf_bytes: bytes, *, verbose: bool = False) -> Tuple[fitz.Document, List[ContainerRef], Dict[str, Any]]:
     """
     Opens the PDF (for writing later) and extracts text blocks using Azure Document Intelligence.
     Returns:
         - open fitz doc (caller will write into it)
-        - extracted blocks list in fitz coordinate space
+        - extracted blocks list as ContainerRef
+        - metadata dict (includes 'mask_regions_by_page' for inpainting)
     """
     t0 = time.perf_counter()
     _vprint(verbose, f"[PIPELINE][EXTRACT] Opening PDF bytes (size={len(pdf_bytes)} bytes)")
@@ -723,9 +694,27 @@ def extract_all_blocks(pdf_bytes: bytes, *, verbose: bool = False) -> Tuple[fitz
     t_di_end = time.perf_counter()
     _vprint(verbose, f"[DOCINT] analyze_result received in {t_di_end - t_di_start:.2f}s")
 
-    blocks = _extract_blocks_from_docintel_result(doc, analyze_result, verbose=verbose)
-    _vprint(verbose, f"[PIPELINE][EXTRACT] Completed extraction in {time.perf_counter() - t0:.2f}s (blocks={len(blocks)})")
-    return doc, blocks
+    # 7.1 Translate containers, not lines
+    blocks = build_containers(doc, analyze_result, verbose=verbose)
+
+    # Build word-level mask regions (used for glyph-accurate inpainting, step 11.3)
+    from services.layout.raster_processor import build_mask_regions_from_analyze_result
+    mask_regions_by_page = build_mask_regions_from_analyze_result(
+        doc, analyze_result, verbose=verbose
+    )
+    _vprint(verbose, f"[PIPELINE][EXTRACT] mask_regions built for {len(mask_regions_by_page)} pages")
+
+    # Metadata for the pipeline (Step 8 routing, etc.)
+    metadata = {
+        "page_count": doc.page_count,
+        "analyze_result": analyze_result,
+        "timing_di_seconds": t_di_end - t_di_start,
+        # per-page word-level mask primitives (dict: page_index -> List[MaskRegion])
+        "mask_regions_by_page": mask_regions_by_page,
+    }
+
+    _vprint(verbose, f"[PIPELINE][EXTRACT] Completed container extraction in {time.perf_counter() - t0:.2f}s (blocks={len(blocks)})")
+    return doc, blocks, metadata
 
 # -----------------------------
 # Apply (write) — keep this single-threaded
@@ -946,12 +935,19 @@ def _get_measure_font(fontname: str, fontfile: Optional[str], *, verbose: bool =
         if f is not None:
             _vprint(verbose, f"[FONT][MEASURE] Cache hit for {key}")
             return f
-        if fontfile:
-            _vprint(verbose, f"[FONT][MEASURE] Loading measure font from file for {key}")
-            f = fitz.Font(fontfile=fontfile)
-        else:
-            _vprint(verbose, f"[FONT][MEASURE] Loading measure font by name for {key}")
-            f = fitz.Font(fontname=fontname) # Base14 like helv
+        
+        try:
+            if fontfile:
+                _vprint(verbose, f"[FONT][MEASURE] Loading measure font from file for {key}")
+                f = fitz.Font(fontfile=fontfile)
+            else:
+                _vprint(verbose, f"[FONT][MEASURE] Loading measure font by name for {key}")
+                f = fitz.Font(fontname=fontname) # Base14 like helv
+        except Exception:
+            # Final fallback: Base14 if everything else fails
+            _vprint(verbose, f"[FONT][MEASURE] Fallback to 'helv' for font={fontname}")
+            f = fitz.Font("helv")
+            
         _MEASURE_FONT_CACHE[key] = f
         return f
 
@@ -1106,7 +1102,7 @@ def _fit_and_insert_textbox(
     cjk_mode = _looks_cjk(t)
 
     max_w = max(1.0, rect.width - 0.2)
-    print(f"Max width for text in rect (rect.width={rect.width}): {max_w:.2f}")
+    _vprint(verbose, f"[APPLY][TEXTBOX] Max width for text in rect (rect.width={rect.width}): {max_w:.2f}")
     lineheight_factor = 1.19
 
     fs = float(max(min_fontsize, start_fontsize))
@@ -1225,134 +1221,174 @@ def _fit_and_insert_textbox(
     return True
 
 
+def remove_text(page: fitz.Page, rects: List[fitz.Rect], verbose: bool = False):
+    """
+    9.3 removal strategy: text-only removal avoiding background nuke.
+    Adds redaction annotations for exact span rects without a fill color (transparent).
+    """
+    for r in rects:
+        # 9.1: No 'fill' color ensures background preservation. 
+        # Content (text strokes/fills) is removed during apply_redactions().
+        page.add_redact_annot(r)
+
+
+def _int_to_rgb(color_int: int) -> Tuple[float, float, float]:
+    r = ((color_int >> 16) & 255) / 255.0
+    g = ((color_int >> 8) & 255) / 255.0
+    b = (color_int & 255) / 255.0
+    return (r, g, b)
+
+
+def _derive_rotation(poly: Optional[List[Tuple[float, float]]]) -> int:
+    """
+    10.3 Rotation support: derive 90-degree increments from polygon.
+    Polygons from DocInt are [x0,y0, x1,y1, x2,y2, x3,y3].
+    """
+    if not poly or len(poly) < 2:
+        return 0
+    # DocInt polygon is often flat list or list of dicts. handle list of Tuples
+    p0, p1 = poly[0], poly[1]
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    angle = math.degrees(math.atan2(dy, dx))
+    # Normalize to 0, 90, 180, 270 for PyMuPDF textbox support
+    return int((round(angle / 90) * 90) % 360)
+
+
 def apply_translations(
     doc: fitz.Document,
-    translations: List[BlockTranslation],
+    translations: List[TranslationPlan],
     *,
     fontname: str = "helv",
     fontsize: float = 11,
+    mask_regions_by_page: Optional[Dict[int, Any]] = None,
     verbose: bool = False,
 ) -> None:
     """
-    Overlay mode, but with REAL removal of original text via redaction so selection works.
-        1) add redaction annots for all target rects on a page
-        2) apply redactions (removes underlying text)
-        3) insert translated text
+    Overlay mode with precision vector removal (Step 9) and style sampling (Step 10).
+    mask_regions_by_page: dict[page_index -> List[MaskRegion]] built from DocInt words.
+    If supplied, inpainting uses glyph-accurate masking (A–D improvements).
     """
-    by_page: Dict[int, List[BlockTranslation]] = {}
+    by_page: Dict[int, List[TranslationPlan]] = {}
     for t in translations:
-        by_page.setdefault(t.block.page_index, []).append(t)
+        by_page.setdefault(t.container.page_index, []).append(t)
 
-    _vprint(verbose, f"[APPLY] Grouped {len(translations)} translations into {len(by_page)} pages")
+    _vprint(verbose, f"[APPLY] Dispatching {len(translations)} containers across {len(by_page)} pages")
 
-    global_stats: Dict[str, int] = {
-        "seen_translations": 0,
-        "planned": 0,
-        "skipped_empty_output_and_original": 0,
-        "redactions_added": 0,
-        "insertions_attempted": 0,
-        "insertions_succeeded": 0,
-        "insertions_failed": 0,
-    }
+    # Map fontname -> (fitz.Font, Optional[fontfile_path])
+    font_resource_cache: Dict[str, Tuple[fitz.Font, Optional[str]]] = {}
+    # Track which fonts are registered on which page indices
+    page_font_registry: Dict[int, Set[str]] = {}
 
-    for page_index, items in by_page.items():
+    for page_index, page_plans in by_page.items():
         page = doc[page_index]
-        _vprint(verbose, f"[APPLY][PAGE {page_index}] Processing {len(items)} translation blocks")
+        _vprint(verbose, f"[APPLY][PAGE {page_index}] Processing {len(page_plans)} containers")
+        
+        if page_index not in page_font_registry:
+            page_font_registry[page_index] = set()
 
-        # prepare rects + outputs first
-        plans: List[Tuple[fitz.Rect, str, str, Optional[str], float]] = []
-        for item_idx, item in enumerate(items, start=1):
-            global_stats["seen_translations"] += 1
+        # Step 12: Hybrid/Raster Routing
+        raster_plans = [p for p in page_plans if not p.container.original_spans]
+        vector_plans = [p for p in page_plans if p.container.original_spans]
 
-            x0, y0, x1, y1 = item.block.bbox
-            rect = _safe_rect(page, fitz.Rect(x0, y0, x1, y1), pad=0.2) # smaller pad reduces collateral damage
+        if raster_plans:
+            # 11.1 Render to Raster
+            from services.layout.raster_processor import render_page_to_pixmap, inpaint_containers, draw_raster_overlay
+            _vprint(verbose, f"[RASTER][PAGE {page_index}] Inpainting {len(raster_plans)} regions...")
 
-            out_text = (getattr(item, "translated_text", None) or "").strip()
-            if not out_text:
-                out_text = (item.block.text or "").strip()
-            if not out_text:
-                global_stats["skipped_empty_output_and_original"] += 1
-                _vprint(verbose, f"[APPLY][PAGE {page_index}] Item #{item_idx} skipped: empty translated+original text")
-                continue
+            pix = render_page_to_pixmap(page, dpi=300)
+            pref = fitz.Rect(page.rect)
+            sx = pix.width / pref.width
+            sy = pix.height / pref.height
 
-            eff_fontname, eff_fontfile = _pick_font(out_text, fontname, verbose=verbose)
-            _vprint(
-                verbose,
-                f"[APPLY][PAGE {page_index}] Plan #{item_idx}: "
-                f"src={_preview_text(item.block.text, 120)!r} -> out={_preview_text(out_text, 120)!r} | "
-                f"rect={_fmt_bbox((rect.x0, rect.y0, rect.x1, rect.y1))} | font='{eff_fontname}' file={eff_fontfile}"
-            )
-            orig_fs = _estimate_fontsize_for_rect(page, rect, verbose=verbose)
-            print(
-                f"[APPLY][PAGE {page_index}] Estimated original font size for item #{item_idx}: "
-                f"{_fmt_float(orig_fs)} if known, else default {fontsize}"
-            )
-            if orig_fs is None:
-                start_fs = min(float(fontsize), max(6.0, rect.height * 0.85))
-            else:
-                # keep it close to original, but clamp to bbox height
-                start_fs = float(orig_fs)
-                start_fs = min(start_fs, max(6.0, rect.height * 0.95))
-                start_fs = max(5.0, start_fs)
-
-            align_eff = _guess_align_for_rect(page, rect)
-
-            plans.append((rect, out_text, eff_fontname, eff_fontfile, start_fs, align_eff))
-            global_stats["planned"] += 1
-
-        if not plans:
-            _vprint(verbose, f"[APPLY][PAGE {page_index}] No plans after filtering; skipping page")
-            continue
-
-        # register all fonts used on this page once
-        seen_fonts = set()
-        for _rect, _out_text, fn, ff, _fs, _al in plans:
-            if ff and fn not in seen_fonts:
-                _ensure_page_font(page, fn, ff, verbose=verbose)
-                seen_fonts.add(fn)
-        _vprint(verbose, f"[APPLY][PAGE {page_index}] Registered {len(seen_fonts)} unique custom fonts")
-
-        # 1) add redactions
-        for rect, _out_text, _fn, _ff, _fs, _al in plans:
-            page.add_redact_annot(rect, fill=(1, 1, 1))
-            global_stats["redactions_added"] += 1
-        _vprint(verbose, f"[APPLY][PAGE {page_index}] Added {len(plans)} redaction annotations")
-
-        # 2) apply redactions ONCE per page (removes underlying text)
-        page.apply_redactions()
-        _vprint(verbose, f"[APPLY][PAGE {page_index}] Redactions applied")
-
-        # 3) insert translated text on top
-        for ins_idx, (rect, out_text, eff_fontname, eff_fontfile, start_fs, align_eff) in enumerate(plans, start=1):
-            ok = _fit_and_insert_textbox(
-                page,
-                rect,
-                out_text,
-                fontname=eff_fontname,
-                fontfile=eff_fontfile,
-                start_fontsize=start_fs,
-                min_fontsize=5.0,
-                align=align_eff,
+            # 11.3 & 11.4 Mask & Inpaint (use word-level MaskRegions when available)
+            raster_conts = [p.container for p in raster_plans]
+            page_mask_regions = (mask_regions_by_page or {}).get(page_index, None)
+            inpainted_pix = inpaint_containers(
+                pix,
+                raster_conts,
+                sx=sx,
+                sy=sy,
+                mask_regions=page_mask_regions,
                 verbose=verbose,
             )
-            if ok:
-                global_stats["insertions_succeeded"] += 1
-            else:
-                global_stats["insertions_failed"] += 1
-                _vprint(verbose, f"[APPLY][PAGE {page_index}] Insertion #{ins_idx} failed")
 
-    if verbose:
-        print("[APPLY] Summary")
-        for k in sorted(global_stats.keys()):
-            print(f"  - {k}: {global_stats[k]}")
+            # 11.5/12 Overlay background
+            draw_raster_overlay(doc, page_index, inpainted_pix)
+
+        # 1) Precise Text Removal (Step 9 / 12)
+        # Even on hybrid pages, we remove vector strokes for mapped containers
+        for plan in vector_plans:
+            span_rects = [fitz.Rect(s.rect) for s in plan.container.original_spans]
+            remove_text(page, span_rects, verbose=verbose)
+        
+        # If inpainting didn't happen (RASTER containers but no OpenCV), use bbox fallback
+        if raster_plans:
+            try:
+                import cv2
+            except ImportError:
+                cv2 = None
+
+            if cv2 is None:
+                for plan in raster_plans:
+                    rect = fitz.Rect(plan.container.bbox)
+                    page.add_redact_annot(_safe_rect(page, rect, pad=0.1))
+
+        # This removes the original vector text content
+        page.apply_redactions()
+
+        # 2) Typesetting & Style Fidelity (Step 10)
+        for plan in page_plans:
+            # 10.3 Rotation: preserve polygon angles
+            if plan.container.polygon:
+                plan.rendering_intent.rotation = _derive_rotation(plan.container.polygon)
+
+            # 10.2 Style fidelity: Sample color/style from original spans
+            if plan.container.original_spans:
+                s0 = plan.container.original_spans[0]
+                plan.rendering_intent.color = _int_to_rgb(s0.color)
+                if plan.rendering_intent.font_size_start <= 1e-3:
+                    plan.rendering_intent.font_size_start = s0.size
+            
+            # Fallback: if we still have no font size (raster or unmatched span),
+            # estimate from the PDF's text layer at the container's bbox location.
+            if plan.rendering_intent.font_size_start <= 1e-3:
+                estimated = _estimate_fontsize_for_rect(page, fitz.Rect(plan.container.bbox), verbose=verbose)
+                plan.rendering_intent.font_size_start = estimated if estimated else 10.0
+
+            # 10.1 Font Strategy (Unicode Fallback)
+            tgt_text = plan.final_rendered_text
+            eff_fontname = plan.rendering_intent.font_name or fontname
+            
+            from services.layout.typesetter import _looks_cjk
+            if _looks_cjk(tgt_text):
+                eff_fontname = "notosans"
+            
+            plan.rendering_intent.font_name = eff_fontname
+            fn = plan.rendering_intent.font_name
+
+            # Cache the font object and file globally for the doc
+            if fn not in font_resource_cache:
+                eff_name, ff = _pick_font(tgt_text, fn, verbose=verbose)
+                mf = _get_measure_font(eff_name, ff, verbose=verbose)
+                font_resource_cache[fn] = (mf, ff)
+
+            # REGISTER on the page every time we move to a new page or usage
+            mf, ff = font_resource_cache[fn]
+            if fn not in page_font_registry[page_index]:
+                _ensure_page_font(page, fn, ff, verbose=verbose)
+                page_font_registry[page_index].add(fn)
+
+            # Invoke Step 8: Kind-aware Typesetting
+            # Pass only the measure fonts part to typeset_and_insert
+            measure_only_map = {k: v[0] for k, v in font_resource_cache.items()}
+            typeset_and_insert(page, fitz.Rect(plan.container.bbox), plan, measure_only_map)
+
+    _vprint(verbose, "[APPLY] Completed typesetting for all containers.")
 
 
 def _normalize_translate_blocks_result(result) -> Tuple[List[BlockTranslation], Dict[str, Any]]:
     """
-    Accept multiple return shapes from translation_service.translate_blocks without breaking compatibility:
-        - List[BlockTranslation]
-        - (translations, diagnostics_dict)
-        - {"translations": [...], "diagnostics": {...}}
+    Accept multiple return shapes from services.translation_service.translate_blocks
     """
     diagnostics: Dict[str, Any] = {}
 
@@ -1373,78 +1409,37 @@ def _normalize_translate_blocks_result(result) -> Tuple[List[BlockTranslation], 
 
 
 def _translate_blocks_with_optional_diagnostics(
-    blocks: List[BlockRef],
+    blocks: List[ContainerRef],
     *,
     source_lang: Optional[str] = None,
     target_lang: Optional[str] = None,
     verbose: bool = False,
-) -> Tuple[List[BlockTranslation], Dict[str, Any]]:
+) -> Tuple[List[ContainerTranslation], Dict[str, Any]]:
     """
     Calls translation_service.translate_blocks in a backward-compatible way.
-    If the service supports debug kwargs, we pass them; otherwise we fall back silently.
     """
-    # rich diagnostics
+    # ... (rest of the logic stays similar but uses ContainerRef/ContainerTranslation)
+    # I'll keep the inspect.signature part for robustness
     try:
         sig = inspect.signature(translate_blocks)
         params = sig.parameters
     except Exception:
         params = {}
 
-    kwargs_candidates: List[Dict[str, Any]] = []
-    if params:
-        kw: Dict[str, Any] = {}
-        if "verbose" in params:
-            kw["verbose"] = verbose
-        if "source_lang" in params:
-            kw["source_lang"] = source_lang
-        if "target_lang" in params:
-            kw["target_lang"] = target_lang
-        if "return_diagnostics" in params:
-            kw["return_diagnostics"] = True
-        if "with_diagnostics" in params:
-            kw["with_diagnostics"] = True
-        if "debug" in params:
-            kw["debug"] = verbose
-        if "log_every_n" in params:
-            kw["log_every_n"] = 5
-        kwargs_candidates.append(kw)
+    kwargs: Dict[str, Any] = {
+        "source_lang": source_lang,
+        "target_lang": target_lang,
+        "verbose": verbose,
+        "return_diagnostics": True
+    }
+    
+    # Filter kwargs based on what translate_blocks actually accepts
+    final_kwargs = {k: v for k, v in kwargs.items() if k in params or not params}
 
-    # fallbacks
-    kwargs_candidates.extend([
-        {}, # classic call
-    ])
-
-    last_exc: Optional[Exception] = None
-    tried = set()
-    for kw in kwargs_candidates:
-        key = tuple(sorted(kw.items()))
-        if key in tried:
-            continue
-        tried.add(key)
-        try:
-            _vprint(verbose, f"[TRANSLATE] Calling translate_blocks with kwargs={kw}")
-            raw = translate_blocks(blocks, **kw)
-            translations, diagnostics = _normalize_translate_blocks_result(raw)
-            if not isinstance(diagnostics, dict):
-                diagnostics = {}
-            _vprint(
-                verbose,
-                f"[TRANSLATE] translate_blocks returned {len(translations) if hasattr(translations, '__len__') else 'unknown'} items; "
-                f"diagnostics_keys={list(diagnostics.keys()) if isinstance(diagnostics, dict) else []}"
-            )
-            return translations, diagnostics
-        except TypeError as e:
-            last_exc = e
-            _vprint(verbose, f"[TRANSLATE] translate_blocks call failed with kwargs={kw}: {e!r}; trying fallback")
-            continue
-
-    # final bare call (if all else fails / non-TypeError cases)
-    if last_exc is not None:
-        _vprint(verbose, f"[TRANSLATE] Falling back to bare translate_blocks(blocks) after TypeError attempts")
-    raw = translate_blocks(blocks)
+    _vprint(verbose, f"[TRANSLATE] Calling translate_blocks with {len(blocks)} chunks")
+    raw = translate_blocks(blocks, **final_kwargs)
     translations, diagnostics = _normalize_translate_blocks_result(raw)
-    if not isinstance(diagnostics, dict):
-        diagnostics = {}
+    
     return translations, diagnostics
 
 
@@ -1455,55 +1450,121 @@ def translate_pdf_bytes_pipeline(
     target_lang: Optional[str] = None, 
     verbose: bool = False
 ) -> bytes:
+    """
+    Step 7 & 8: High-fidelity container-based translation pipeline.
+    """
     total_t0 = time.perf_counter()
     extraction_time = translation_time = apply_time = save_time = 0.0
     diagnostics: Dict[str, Any] = {}
     errors = 0
 
-    _vprint(verbose, f"[PIPELINE] Starting PDF Translation pipeline | {source_lang} -> {target_lang}...")
-    _vprint(verbose, "[PIPELINE] Extracting blocks with Azure Document Intelligence...")
+    _vprint(verbose, f"[PIPELINE] Starting PDF Translation | {source_lang} -> {target_lang}...")
 
+    # Stage 1: Container-first Extraction (Step 7.1)
     t0 = time.perf_counter()
-    doc, blocks = extract_all_blocks(pdf_bytes, verbose=verbose)
+    doc, orig_containers, metadata = extract_all_blocks(pdf_bytes, verbose=verbose)
     extraction_time = time.perf_counter() - t0
-    _vprint(verbose, f"[PIPELINE] Extracted {len(blocks)} blocks in {extraction_time:.2f}s. Translating...")
+    _vprint(verbose, f"[PIPELINE] Extracted {len(orig_containers)} containers in {extraction_time:.2f}s.")
 
+    # Stage 2: Normalization & Policy Attribution (Step 7.3 / 8.3)
+    containers_to_translate = []
+    translate_idx_map = []
+    norm_states = []
+    policies = []
+
+    for i, c in enumerate(orig_containers):
+        # 7.2 Protected-token integrity (part of normalization)
+        norm_text, state = apply_normalization_pipeline(c.text)
+        
+        # 8.3 Kind-aware classification
+        policy = classify_container(c)
+        
+        norm_states.append(state)
+        policies.append(policy)
+        
+        if policy != TranslationPolicy.SKIP:
+            # Create normalized clone for translation — must preserve paragraph_group_id
+            # so translation_service can build the per-paragraph context window.
+            c_norm = ContainerRef(
+                page_index=c.page_index,
+                bbox=c.bbox,
+                text=norm_text,
+                kind=c.kind,
+                polygon=c.polygon,
+                style_hints=c.style_hints,
+                reading_key=c.reading_key,
+                original_spans=c.original_spans,
+                paragraph_group_id=c.paragraph_group_id,  # ← crucial for LLM1 context
+            )
+            containers_to_translate.append(c_norm)
+            translate_idx_map.append(i)
+
+    # Stage 3: High-context Translation (Step 7.1 / 7.2)
     try:
         t1 = time.perf_counter()
-        # PoC: translation_service handles the 3-stage pipeline - wrapped with optional diagnostics
         translations, diagnostics = _translate_blocks_with_optional_diagnostics(
-            blocks, 
+            containers_to_translate, 
             source_lang=source_lang, 
             target_lang=target_lang, 
             verbose=verbose
         )
         translation_time = time.perf_counter() - t1
 
-        _vprint(verbose, f"[PIPELINE] Translations obtained: {len(translations)} items in {translation_time:.2f}s")
-        if len(translations) != len(blocks):
-            _vprint(
-                verbose,
-                f"[PIPELINE][WARN] Translation count ({len(translations)}) != extracted block count ({len(blocks)}). "
-                "This may be expected if translation_service filters/merges blocks."
+        # Stage 4: Restore & Map to Plans (Step 7.2 integrity)
+        trans_idx = 0
+        plans = []
+        for i, c in enumerate(orig_containers):
+            policy = policies[i]
+            norm_state = norm_states[i]
+            
+            if policy == TranslationPolicy.SKIP:
+                trans_text = c.text
+            else:
+                trans_text = translations[trans_idx].translated_text
+                trans_idx += 1
+            
+            # Step 7.2: Final restoration of placeholders
+            final_txt = restore_protected_tokens(trans_text, norm_state)
+            
+            # Build rendering intent (Step 8 basics)
+            intent = RenderingIntent(
+                font_name="helv", # Default, typesetter will refine from style spans
+                font_size_start=0.0, # typesetter will estimate
+                alignment=0 # internal default
             )
+            
+            plan = TranslationPlan(
+                container=c,
+                normalized_source_text=containers_to_translate[trans_idx-1].text if policy != TranslationPolicy.SKIP else c.text,
+                protected_tokens_map=norm_state.placeholders,
+                translated_text=trans_text,
+                final_rendered_text=final_txt,
+                rendering_intent=intent,
+                policy=policy
+            )
+            plans.append(plan)
 
-        _print_translation_samples(blocks, translations, diagnostics, verbose=verbose)
+        _print_translation_samples(orig_containers, plans, diagnostics, verbose=verbose)
 
-        _vprint(verbose, "[PIPELINE] Applying translations to PDF...")
+        # Stage 5: Kind-aware Typesetting (Step 8)
+        _vprint(verbose, "[PIPELINE] Applying kind-aware typesetting...")
         t2 = time.perf_counter()
-        apply_translations(doc, translations, verbose=verbose)
+        apply_translations(
+            doc,
+            plans,
+            mask_regions_by_page=metadata.get("mask_regions_by_page"),
+            verbose=verbose,
+        )
         apply_time = time.perf_counter() - t2
-        _vprint(verbose, f"[PIPELINE] Applied translations in {apply_time:.2f}s. Saving PDF...")
 
         t3 = time.perf_counter()
         out_bytes = doc.tobytes(deflate=True, garbage=4)
         save_time = time.perf_counter() - t3
-        _vprint(verbose, f"[PIPELINE] Saved PDF bytes in {save_time:.2f}s (size={len(out_bytes)} bytes)")
 
         total_time = time.perf_counter() - total_t0
         _print_timing_report(
             verbose=verbose,
-            chunks_processed=len(blocks),
+            chunks_processed=len(orig_containers),
             extraction_time=extraction_time,
             translation_time=translation_time,
             apply_time=apply_time,
@@ -1514,24 +1575,29 @@ def translate_pdf_bytes_pipeline(
         )
         return out_bytes
 
-    except Exception:
+    except Exception as e:
         errors += 1
+        _vprint(verbose, f"[PIPELINE][FATAL] {e!r}")
         total_time = time.perf_counter() - total_t0
         _print_timing_report(
             verbose=verbose,
-            chunks_processed=len(blocks) if 'blocks' in locals() else 0,
+            chunks_processed=len(orig_containers) if 'orig_containers' in locals() else 0,
             extraction_time=extraction_time,
             translation_time=translation_time,
             apply_time=apply_time,
             save_time=save_time,
             total_time=total_time,
-            diagnostics=diagnostics,
+            diagnostics=diagnostics if 'diagnostics' in locals() else None,
             errors=errors,
         )
         raise
     finally:
-        doc.close()
-        _vprint(verbose, "[PIPELINE] Pipeline completed! (doc closed)")
+        if 'doc' in locals() and doc:
+            try:
+                doc.close()
+                _vprint(verbose, "[PIPELINE] Pipeline completed! (doc closed)")
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

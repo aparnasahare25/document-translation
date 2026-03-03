@@ -487,6 +487,7 @@ def build_refinement_prompt(
     verbose: bool,
     source_lang: str,
     target_lang: str,
+    is_short_mode: bool = False,
 ) -> Dict[str, Any]:
     """
     LLM sees:
@@ -504,6 +505,9 @@ def build_refinement_prompt(
     else:
         system_msg = get_no_placeholder_sys_prompt(source_lang, target_lang).strip()
 
+    if is_short_mode:
+        system_msg += "\n\nCRITICAL: SHORT MODE ACTIVE. Deliver the shortest valid translation variant. Eliminate redundant words/articles."
+
     user_payload = {
         "source_en": english_chunk,
         "current_translation": current_translation,
@@ -519,7 +523,7 @@ def build_refinement_prompt(
         if glossary_paragraphs:
             _print_kv("Top glossary preview", _preview(glossary_paragraphs[0].get("content", ""), 220))
 
-    return {"system": system_msg, "user_payload": user_payload}
+    return {"system": system_msg, "user_payload": user_payload, "is_short_mode": is_short_mode}
 
 
 # -----------------------------------------------------------------------------
@@ -534,6 +538,7 @@ def refine_segment_with_glossary(
     *,
     source_lang: Optional[str] = None,
     target_lang: Optional[str] = None,
+    is_short_mode: bool = False,
 ) -> str:
     """
     Main API:
@@ -588,6 +593,7 @@ def refine_segment_with_glossary(
         verbose=verbose,
         source_lang=source_lang or "en",
         target_lang=target_lang or "ja",
+        is_short_mode=is_short_mode,
     )
 
     llm_output = call_llm_json(prompt["system"], prompt["user_payload"], verbose=verbose)
