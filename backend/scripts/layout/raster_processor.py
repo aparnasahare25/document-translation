@@ -19,8 +19,8 @@ try:
 except ImportError:
     cv2 = None
 
-from services.layout.containers import ContainerRef
-from services.layout.geometry import (
+from scripts.layout.containers import ContainerRef
+from scripts.layout.geometry import (
     poly_to_bbox as _poly_to_bbox,
     scale_bbox as _scale_bbox,
     scale_poly as _scale_poly,

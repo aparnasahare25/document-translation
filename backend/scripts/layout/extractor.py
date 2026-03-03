@@ -2,8 +2,8 @@ import fitz
 import re
 from typing import List, Dict, Tuple, Any, Optional
 
-from services.layout.containers import ContainerRef, ContainerKind, PdfSpanAttrs
-from services.layout.geometry import (
+from scripts.layout.containers import ContainerRef, ContainerKind, PdfSpanAttrs
+from scripts.layout.geometry import (
     poly_to_bbox as _poly_to_bbox,
     scale_bbox as _scale_bbox,
     scale_poly as _scale_poly,

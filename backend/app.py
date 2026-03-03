@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 
-from pdf_pipeline import translate_pdf_bytes_pipeline
+from services.pdf_pipeline import translate_pdf_bytes_pipeline
 
 load_dotenv(override=True)
 VERBOSE_FLAG = os.getenv("VERBOSE_FLAG", False).lower() in ("true", "1", "yes")

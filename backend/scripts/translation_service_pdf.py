@@ -5,10 +5,8 @@ import json, os, re, threading, time, requests
 from typing import Any, Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from services.glossary_retrieval.refine_with_glossary import refine_segment_with_glossary
-
-
-from services.layout.containers import ContainerRef, ContainerTranslation
+from scripts.layout.containers import ContainerRef, ContainerTranslation
+from scripts.glossary_retrieval.refine_with_glossary import refine_segment_with_glossary
 
 
 # -----------------------------

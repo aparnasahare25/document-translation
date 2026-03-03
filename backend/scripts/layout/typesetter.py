@@ -2,7 +2,7 @@ import fitz
 import re
 from typing import List, Optional
 
-from services.layout.containers import TranslationPlan, ContainerKind
+from scripts.layout.containers import TranslationPlan, ContainerKind
 
 def _looks_cjk(text: str) -> bool:
     for ch in text:

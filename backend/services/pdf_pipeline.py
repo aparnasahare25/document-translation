@@ -9,11 +9,11 @@ import os, fitz, io, re, threading, time, inspect, math # PyMuPDF (used for writ
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 
-from services.layout.extractor import build_containers
-from services.translation_service import translate_blocks
-from services.layout.typesetter import typeset_and_insert
-from services.layout.classifier import classify_container
-from services.layout.containers import (
+from scripts.layout.extractor import build_containers
+from scripts.translation_service_pdf import translate_blocks
+from scripts.layout.typesetter import typeset_and_insert
+from scripts.layout.classifier import classify_container
+from scripts.layout.containers import (
     ContainerRef,
     ContainerKind,
     TranslationPlan,
@@ -21,7 +21,7 @@ from services.layout.containers import (
     TranslationPolicy,
     ContainerTranslation,
 )
-from services.layout.geometry import (
+from scripts.layout.geometry import (
     poly_to_bbox as _poly_to_bbox,
     scale_bbox as _scale_bbox,
     scale_poly as _scale_poly,
@@ -29,7 +29,7 @@ from services.layout.geometry import (
     bbox_overlap_area as _bbox_overlap_area,
     bbox_area as _bbox_area,
 )
-from services.text_normalization.normalizer import apply_normalization_pipeline, restore_protected_tokens
+from scripts.text_normalization.normalizer import apply_normalization_pipeline, restore_protected_tokens
 
 
 # -----------------------------
@@ -698,7 +698,7 @@ def extract_all_blocks(pdf_bytes: bytes, *, verbose: bool = False) -> Tuple[fitz
     blocks = build_containers(doc, analyze_result, verbose=verbose)
 
     # Build word-level mask regions (used for glyph-accurate inpainting, step 11.3)
-    from services.layout.raster_processor import build_mask_regions_from_analyze_result
+    from scripts.layout.raster_processor import build_mask_regions_from_analyze_result
     mask_regions_by_page = build_mask_regions_from_analyze_result(
         doc, analyze_result, verbose=verbose
     )
@@ -1292,7 +1292,7 @@ def apply_translations(
 
         if raster_plans:
             # 11.1 Render to Raster
-            from services.layout.raster_processor import render_page_to_pixmap, inpaint_containers, draw_raster_overlay
+            from scripts.layout.raster_processor import render_page_to_pixmap, inpaint_containers, draw_raster_overlay
             _vprint(verbose, f"[RASTER][PAGE {page_index}] Inpainting {len(raster_plans)} regions...")
 
             pix = render_page_to_pixmap(page, dpi=300)
@@ -1359,7 +1359,7 @@ def apply_translations(
             tgt_text = plan.final_rendered_text
             eff_fontname = plan.rendering_intent.font_name or fontname
             
-            from services.layout.typesetter import _looks_cjk
+            from scripts.layout.typesetter import _looks_cjk
             if _looks_cjk(tgt_text):
                 eff_fontname = "notosans"
             

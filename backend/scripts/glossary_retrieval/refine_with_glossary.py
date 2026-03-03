@@ -22,7 +22,7 @@ from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.models import VectorizedQuery
 
-from services.glossary_retrieval.prompts import get_placeholder_sys_prompt, get_no_placeholder_sys_prompt
+from scripts.glossary_retrieval.prompts import get_placeholder_sys_prompt, get_no_placeholder_sys_prompt
 
 
 # -------------------------

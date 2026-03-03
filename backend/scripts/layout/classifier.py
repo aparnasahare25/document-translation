@@ -1,7 +1,7 @@
 import re
 from typing import Dict, Any
 
-from services.layout.containers import ContainerRef, ContainerKind, TranslationPolicy
+from scripts.layout.containers import ContainerRef, ContainerKind, TranslationPolicy
 
 def classify_container(container: ContainerRef, verbose: bool = False) -> TranslationPolicy:
     text = container.text.strip()
