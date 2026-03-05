@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dotenv import load_dotenv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 import os, fitz, io, re, threading, time, inspect, math # PyMuPDF (used for writing back into the PDF)
 
@@ -1221,15 +1221,39 @@ def _fit_and_insert_textbox(
     return True
 
 
-def remove_text(page: fitz.Page, rects: List[fitz.Rect], verbose: bool = False):
+def remove_text(page: fitz.Page, rects: List[fitz.Rect], pix: fitz.Pixmap, verbose: bool = False):
     """
     9.3 removal strategy: text-only removal avoiding background nuke.
-    Adds redaction annotations for exact span rects without a fill color (transparent).
+    Adds redaction annotations filled with the sampled background color of the region.
+    When apply_redactions() runs, it removes original intersecting text/graphics
+    and leaves behind a solid patch of background color.
     """
+    from collections import Counter
     for r in rects:
-        # 9.1: No 'fill' color ensures background preservation. 
-        # Content (text strokes/fills) is removed during apply_redactions().
-        page.add_redact_annot(r)
+        # Sample background color from the perimeter (+2px)
+        x0 = max(0, int(r.x0))
+        y0 = max(0, int(r.y0))
+        x1 = min(pix.width - 1, int(r.x1))
+        y1 = min(pix.height - 1, int(r.y1))
+        
+        colors = []
+        for x in range(x0, x1 + 1):
+            colors.append(pix.pixel(x, y0))
+            colors.append(pix.pixel(x, y1))
+        for y in range(y0, y1 + 1):
+            colors.append(pix.pixel(x0, y))
+            colors.append(pix.pixel(x1, y))
+            
+        if not colors:
+            bg_fill = (1.0, 1.0, 1.0)
+        else:
+            mc = Counter(colors).most_common(1)[0][0]
+            if isinstance(mc, int):
+                bg_fill = (1.0, 1.0, 1.0)  # Handle grayscale fallback
+            else:
+                bg_fill = (mc[0]/255.0, mc[1]/255.0, mc[2]/255.0)
+                
+        page.add_redact_annot(r, fill=bg_fill)
 
 
 def _int_to_rgb(color_int: int) -> Tuple[float, float, float]:
@@ -1317,9 +1341,15 @@ def apply_translations(
 
         # 1) Precise Text Removal (Step 9 / 12)
         # Even on hybrid pages, we remove vector strokes for mapped containers
-        for plan in vector_plans:
-            span_rects = [fitz.Rect(s.rect) for s in plan.container.original_spans]
-            remove_text(page, span_rects, verbose=verbose)
+        # 1) Precise Text Removal (Step 9 / 12)
+        # Even on hybrid pages, we remove vector strokes for mapped containers
+        if vector_plans:
+            # Create a 72-DPI base pixmap to sample perimeter colors 
+            # so we can dynamically color the redaction fill without causing white boxes.
+            bg_pix = page.get_pixmap(dpi=72)
+            for plan in vector_plans:
+                span_rects = [fitz.Rect(s.rect) for s in plan.container.original_spans]
+                remove_text(page, span_rects, bg_pix, verbose=verbose)
         
         # If inpainting didn't happen (RASTER containers but no OpenCV), use bbox fallback
         if raster_plans:
@@ -1384,6 +1414,193 @@ def apply_translations(
             typeset_and_insert(page, fitz.Rect(plan.container.bbox), plan, measure_only_map)
 
     _vprint(verbose, "[APPLY] Completed typesetting for all containers.")
+
+
+# -----------------------------
+# Paragraph-aware merge / unmerge
+# -----------------------------
+_LINE_TAG_RE = re.compile(r"\[L(\d+)\](.*?)\[/L\1\]", re.DOTALL)
+
+
+@dataclass
+class _MergeEntry:
+    """Bookkeeping for one item sent into translate_blocks after merging."""
+    original_indices: List[int]          # indices into the pre-merge container list
+    line_count: int                      # how many lines were merged (1 = passthrough)
+    merged_container: ContainerRef       # the (possibly synthetic) container
+
+
+def _merge_paragraph_groups(
+    containers: List[ContainerRef],
+    *,
+    verbose: bool = False,
+) -> Tuple[List[ContainerRef], List[_MergeEntry]]:
+    """
+    Group containers that share a paragraph_group_id and merge their text
+    with [L1]...[/L1][L2]...[/L2] delimiters.
+
+    Singletons (group size 1) and items with paragraph_group_id=None pass
+    through unchanged.
+
+    Returns:
+        merged_containers – smaller list of ContainerRefs ready for translation
+        merge_map         – one _MergeEntry per merged item (for unmerging later)
+    """
+    # Build ordered groups preserving first-seen order
+    group_order: List[Optional[str]] = []          # ordered unique group IDs (None = ungrouped)
+    group_items: Dict[Optional[str], List[int]] = {}  # gid -> list of indices
+    seen_gids: set = set()
+
+    for idx, c in enumerate(containers):
+        gid = c.paragraph_group_id
+        if gid is None:
+            # Each ungrouped item is its own "group" – use a unique key
+            key = f"__ungrouped_{idx}"
+            group_order.append(key)
+            group_items[key] = [idx]
+        else:
+            if gid not in seen_gids:
+                group_order.append(gid)
+                seen_gids.add(gid)
+            group_items.setdefault(gid, []).append(idx)
+
+    merged_containers: List[ContainerRef] = []
+    merge_map: List[_MergeEntry] = []
+
+    merged_count = 0
+    for gid in group_order:
+        indices = group_items[gid]
+
+        if len(indices) == 1:
+            # Singleton – pass through unchanged
+            c = containers[indices[0]]
+            merged_containers.append(c)
+            merge_map.append(_MergeEntry(
+                original_indices=indices,
+                line_count=1,
+                merged_container=c,
+            ))
+        else:
+            # Multi-line paragraph – build delimited text
+            parts: List[str] = []
+            bboxes: List[Tuple[float, float, float, float]] = []
+            for line_num, ci in enumerate(indices, start=1):
+                parts.append(f"[L{line_num}]{containers[ci].text}[/L{line_num}]")
+                bboxes.append(containers[ci].bbox)
+
+            merged_text = "".join(parts)
+            merged_bbox = _union_bbox(bboxes)
+
+            # Use the first line's metadata for the virtual container
+            first = containers[indices[0]]
+            virtual = ContainerRef(
+                page_index=first.page_index,
+                bbox=merged_bbox,
+                text=merged_text,
+                kind=first.kind,
+                polygon=first.polygon,
+                reading_key=first.reading_key,
+                style_hints=first.style_hints,
+                original_spans=[],  # spans stay on the real per-line containers
+                paragraph_group_id=first.paragraph_group_id,
+            )
+
+            merged_containers.append(virtual)
+            merge_map.append(_MergeEntry(
+                original_indices=indices,
+                line_count=len(indices),
+                merged_container=virtual,
+            ))
+            merged_count += 1
+
+    _vprint(
+        verbose,
+        f"[MERGE] {len(containers)} containers -> {len(merged_containers)} "
+        f"({merged_count} paragraph groups merged)",
+    )
+    return merged_containers, merge_map
+
+
+def _unmerge_paragraph_translations(
+    translations: List[ContainerTranslation],
+    merge_map: List[_MergeEntry],
+    original_containers: List[ContainerRef],
+    *,
+    verbose: bool = False,
+) -> List[ContainerTranslation]:
+    """
+    Expand merged translations back to one ContainerTranslation per original
+    container using [L1]...[/L1] delimiter parsing.
+
+    Fallback strategy when delimiters are missing/corrupted:
+        1) Try regex parse for all N expected line tags
+        2) If partial delimiters found, use them for matched lines and
+           assign remaining text proportionally
+        3) Final fallback: assign the full translated text to every line
+    """
+    expanded: List[ContainerTranslation] = []
+
+    for entry, trans in zip(merge_map, translations):
+        if entry.line_count == 1:
+            # Singleton – rewire to original container and pass through
+            orig_c = original_containers[entry.original_indices[0]]
+            expanded.append(ContainerTranslation(
+                container=orig_c,
+                translated_text=trans.translated_text,
+            ))
+            continue
+
+        # Multi-line: parse delimiters
+        raw = trans.translated_text
+        matches = _LINE_TAG_RE.findall(raw)
+        parsed: Dict[int, str] = {}  # 1-indexed line_num -> text
+        for num_str, text in matches:
+            parsed[int(num_str)] = text.strip()
+
+        n = entry.line_count
+
+        if len(parsed) == n and all(i in parsed for i in range(1, n + 1)):
+            # Happy path: all delimiters found
+            for line_num, ci in enumerate(entry.original_indices, start=1):
+                expanded.append(ContainerTranslation(
+                    container=original_containers[ci],
+                    translated_text=parsed[line_num],
+                ))
+            _vprint(verbose, f"[UNMERGE] group gid={entry.merged_container.paragraph_group_id}: "
+                    f"parsed {n}/{n} line tags OK")
+        else:
+            # Fallback: delimiters missing or corrupted
+            # Strip any surviving tags and distribute text evenly across lines
+            clean = _LINE_TAG_RE.sub("", raw).strip()
+            if not clean:
+                clean = raw  # if stripping removed everything, keep raw
+
+            _vprint(verbose, f"[UNMERGE][FALLBACK] group gid={entry.merged_container.paragraph_group_id}: "
+                    f"expected {n} tags, found {len(parsed)}. Using proportional split.")
+
+            # Proportional split by source text length
+            src_lengths = [len(original_containers[ci].text) for ci in entry.original_indices]
+            total_src = sum(src_lengths) or 1
+            trans_len = len(clean)
+
+            offset = 0
+            for line_idx, ci in enumerate(entry.original_indices):
+                proportion = src_lengths[line_idx] / total_src
+                chunk_len = int(round(proportion * trans_len))
+                # Last line gets the remainder to avoid off-by-one
+                if line_idx == len(entry.original_indices) - 1:
+                    chunk = clean[offset:]
+                else:
+                    chunk = clean[offset:offset + chunk_len]
+                offset += chunk_len
+
+                expanded.append(ContainerTranslation(
+                    container=original_containers[ci],
+                    translated_text=chunk.strip(),
+                ))
+
+    _vprint(verbose, f"[UNMERGE] Expanded {len(translations)} merged items -> {len(expanded)} translations")
+    return expanded
 
 
 def _normalize_translate_blocks_result(result) -> Tuple[List[BlockTranslation], Dict[str, Any]]:
@@ -1501,14 +1718,26 @@ def translate_pdf_bytes_pipeline(
 
     # Stage 3: High-context Translation (Step 7.1 / 7.2)
     try:
+        # 3a. Paragraph-aware merge: group lines with shared paragraph_group_id
+        #     into [L1]...[/L1][L2]...[/L2] delimited text so the translator
+        #     sees full paragraph context.
+        merged_containers, merge_map = _merge_paragraph_groups(
+            containers_to_translate, verbose=verbose
+        )
+
         t1 = time.perf_counter()
-        translations, diagnostics = _translate_blocks_with_optional_diagnostics(
-            containers_to_translate, 
+        merged_translations, diagnostics = _translate_blocks_with_optional_diagnostics(
+            merged_containers,
             source_lang=source_lang, 
             target_lang=target_lang, 
             verbose=verbose
         )
         translation_time = time.perf_counter() - t1
+
+        # 3b. Unmerge: expand delimited translations back to per-line results
+        translations = _unmerge_paragraph_translations(
+            merged_translations, merge_map, containers_to_translate, verbose=verbose
+        )
 
         # Stage 4: Restore & Map to Plans (Step 7.2 integrity)
         trans_idx = 0

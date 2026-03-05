@@ -133,17 +133,170 @@ def _truncate_lines_to_height(lines: List[str], font: fitz.Font, fontsize: float
     out[-1] = (last + ell) if last else ell
     return out
 
+def _int_to_rgb(color_int: int):
+    """Convert integer color to (r, g, b) floats."""
+    r = ((color_int >> 16) & 255) / 255.0
+    g = ((color_int >> 8) & 255) / 255.0
+    b = (color_int & 255) / 255.0
+    return (r, g, b)
+
+
+def typeset_and_insert_spans(
+    page: fitz.Page,
+    plan: TranslationPlan,
+    font_map: dict,  # dict of fontname -> fitz.Font for measuring
+) -> bool:
+    """
+    Span-level origin-based text insertion for precise layout fidelity.
+
+    Uses ``original_spans`` to place translated text at the exact original
+    baseline origin with the original font size and color.  Falls back to
+    progressive font shrinking when the translated text is wider than the
+    available space (computed from the container bbox).
+
+    For multi-span containers (e.g. table cells with several visual lines)
+    the text is distributed across the span origins so each visual row is
+    preserved.
+    """
+    text = plan.final_rendered_text.strip()
+    if not text:
+        return False
+
+    spans = plan.container.original_spans
+    if not spans:
+        return False  # caller should use textbox fallback
+
+    intent = plan.rendering_intent
+    fontname = intent.font_name
+    mf = font_map.get(fontname)
+    if not mf:
+        mf = fitz.Font("helv")
+
+    bbox = plan.container.bbox
+    available_w = max(1.0, bbox[2] - bbox[0] - 0.4)
+
+    # ── Cluster spans into visual lines by y-proximity ──
+    # Spans on the same baseline (within half the font size) belong to
+    # the same visual line.
+    sorted_spans = sorted(spans, key=lambda s: (s.origin[1], s.origin[0]))
+    visual_lines: list = []  # list of lists of PdfSpanAttrs
+    cur_line: list = []
+    cur_y: Optional[float] = None
+
+    for sp in sorted_spans:
+        oy = sp.origin[1]
+        if cur_y is None or abs(oy - cur_y) < sp.size * 0.6:
+            cur_line.append(sp)
+            cur_y = oy
+        else:
+            if cur_line:
+                visual_lines.append(cur_line)
+            cur_line = [sp]
+            cur_y = oy
+    if cur_line:
+        visual_lines.append(cur_line)
+
+    num_vis_lines = len(visual_lines)
+
+    # ── Split translated text into chunks, one per visual line ──
+    if num_vis_lines == 1:
+        line_texts = [text]
+    else:
+        # Split by newlines first (translator might use them)
+        parts = text.split("\n")
+        if len(parts) == num_vis_lines:
+            line_texts = parts
+        else:
+            # Proportional split by original span text length
+            orig_lengths = []
+            for vl in visual_lines:
+                orig_lengths.append(sum(len(s.text) for s in vl) or 1)
+            total_orig = sum(orig_lengths)
+            flat = text.replace("\n", " ")
+            line_texts = []
+            offset = 0
+            for idx, ol in enumerate(orig_lengths):
+                proportion = ol / total_orig
+                chunk_len = int(round(proportion * len(flat)))
+                if idx == len(orig_lengths) - 1:
+                    line_texts.append(flat[offset:].strip())
+                else:
+                    line_texts.append(flat[offset:offset + chunk_len].strip())
+                    offset += chunk_len
+
+    # ── Insert each visual line at its origin ──
+    shape = page.new_shape()
+    cjk_mode = _looks_cjk(text)
+
+    for vl_idx, (vl_spans, lt) in enumerate(zip(visual_lines, line_texts)):
+        if not lt:
+            continue
+
+        # Use leftmost span origin as insertion point
+        first_span = min(vl_spans, key=lambda s: s.origin[0])
+        origin = fitz.Point(first_span.origin[0], first_span.origin[1])
+        base_fs = max(first_span.size, 4.0)
+        color = _int_to_rgb(first_span.color)
+
+        # Progressive font shrinking if text is too wide
+        fs = base_fs
+        min_fs = max(3.5, base_fs * 0.45)
+        text_w = float(mf.text_length(lt, fontsize=fs))
+
+        while text_w > available_w and fs > min_fs:
+            fs = max(min_fs, fs - 0.5)
+            text_w = float(mf.text_length(lt, fontsize=fs))
+
+        # If still too wide, truncate with ellipsis
+        if text_w > available_w:
+            ell = "…"
+            truncated = lt
+            while truncated and float(mf.text_length(truncated + ell, fontsize=fs)) > available_w:
+                truncated = truncated[:-1]
+            lt = (truncated + ell) if truncated else ell
+
+        # Adjust origin Y if font size changed (keep baseline visually close)
+        if abs(fs - base_fs) > 0.1:
+            # Shift up slightly so baseline stays roughly in the same place
+            origin = fitz.Point(origin.x, origin.y)
+
+        shape.insert_text(
+            origin,
+            lt,
+            fontname=fontname,
+            fontsize=fs,
+            color=color,
+        )
+
+    shape.commit(overlay=True)
+    return True
+
+
 def typeset_and_insert(
     page: fitz.Page, 
     rect: fitz.Rect, 
     plan: TranslationPlan,
     font_map: dict # dict of fontname -> fitz.Font for measuring
 ) -> bool:
-    """Implement kind-aware typesetting policies"""
+    """Implement kind-aware typesetting policies.
+    
+    Delegates to span-level origin-based insertion when original_spans
+    are available (vector text), otherwise uses bbox-based textbox insertion
+    (raster / no-span fallback).
+    """
     text = plan.final_rendered_text.strip()
     if not text:
         return False
-        
+
+    # ── Span-based path: precise origin insertion ──
+    # Bypass exact-origin placement for table cells so they can reflow inside their full bbox
+    if plan.container.original_spans and plan.container.kind != ContainerKind.TABLE_CELL:
+        ok = typeset_and_insert_spans(page, plan, font_map)
+        if ok:
+            return True
+        # fall through to textbox if span path fails
+
+    # ── Textbox-based path (raster / fallback) ──
     intent = plan.rendering_intent
     fontname = intent.font_name
     mf = font_map.get(fontname)
