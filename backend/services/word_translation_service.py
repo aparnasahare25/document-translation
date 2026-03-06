@@ -149,8 +149,15 @@ class DocxFormatter:
                     self._collect_paragraph_runs(paragraph, run_refs, texts)
 
         for section in doc.sections:
+            # Default (odd-page) header & footer
             _collect_hf_paragraphs(section.header)
             _collect_hf_paragraphs(section.footer)
+            # First-page header & footer (used when "Different First Page" is enabled)
+            _collect_hf_paragraphs(section.first_page_header)
+            _collect_hf_paragraphs(section.first_page_footer)
+            # Even-page header & footer (used when "Different Odd & Even Pages" is enabled)
+            _collect_hf_paragraphs(section.even_page_header)
+            _collect_hf_paragraphs(section.even_page_footer)
 
         return run_refs, texts
 
@@ -196,8 +203,15 @@ class DocxFormatter:
                     self._format_paragraph_structure(paragraph, skip_font_enforcement=True)
 
         for section in doc.sections:
+            # Default (odd-page) header & footer
             _fmt_hf_paragraphs(section.header)
             _fmt_hf_paragraphs(section.footer)
+            # First-page header & footer
+            _fmt_hf_paragraphs(section.first_page_header)
+            _fmt_hf_paragraphs(section.first_page_footer)
+            # Even-page header & footer
+            _fmt_hf_paragraphs(section.even_page_header)
+            _fmt_hf_paragraphs(section.even_page_footer)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -231,10 +245,15 @@ class DocxFormatter:
         run_refs, texts = self._collect_all_runs(doc)
         print(f"  → {len(texts)} translatable runs found.")
 
-        # Step 3 – Batch translate (1 API call per 100 runs)
-        print(f"Translating to '{self.to_lang}' in batches of 100...")
-        translated_texts = self.translator.batch_translate(texts, self.to_lang)
-        print(f"  → Translation done ({len(translated_texts)} strings).")
+        # Step 3 – Batch translate: full 3-stage pipeline (MT → LLM1 → RAG+LLM2)
+        print(f"Translating '{self.from_lang}' → '{self.to_lang}' via 3-stage pipeline ...")
+        # translated_texts = self.translator.batch_translate_with_pipeline(
+        #     texts, self.from_lang, self.to_lang
+        # )
+        translated_texts = self.translator.batch_translate(
+            texts, self.to_lang
+        )
+        print(f"  → Pipeline done ({len(translated_texts)} strings).")
 
         # Step 4 – Write back
         print("Writing translations back to document runs...")
@@ -263,9 +282,9 @@ class DocxFormatter:
 # Example usage
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    from_lang = "ja"
-    to_lang = "en"
-    input_doc_path = r"C:\gen_ai\document-translation\backend\data\word file\japanese\JP_Workplace_Safety_Manual.docx"
+    from_lang = "en"
+    to_lang = "ja"
+    input_doc_path = r"C:\gen_ai\document-translation\backend\data\word file\Employee_Handbook_NovaTech - Copy.docx"
     file_extension = os.path.splitext(input_doc_path)[1]
     input_doc_name = os.path.splitext(os.path.basename(input_doc_path))[0]
     output_doc_path = f"{input_doc_name}_{from_lang}_{to_lang}{file_extension}"
