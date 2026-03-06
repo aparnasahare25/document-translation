@@ -247,12 +247,12 @@ class DocxFormatter:
 
         # Step 3 – Batch translate: full 3-stage pipeline (MT → LLM1 → RAG+LLM2)
         print(f"Translating '{self.from_lang}' → '{self.to_lang}' via 3-stage pipeline ...")
-        # translated_texts = self.translator.batch_translate_with_pipeline(
-        #     texts, self.from_lang, self.to_lang
-        # )
-        translated_texts = self.translator.batch_translate(
-            texts, self.to_lang
+        translated_texts = self.translator.batch_translate_with_pipeline(
+            texts, self.from_lang, self.to_lang
         )
+        # translated_texts = self.translator.batch_translate(
+        #     texts, self.to_lang
+        # )
         print(f"  → Pipeline done ({len(translated_texts)} strings).")
 
         # Step 4 – Write back
