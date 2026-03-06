@@ -24,11 +24,14 @@ YOU MUST:
 - **STRICTLY APPLY** the glossary:
     - IF A TERM IN THE {src_upper} SOURCE TEXT EXACTLY MATCHES A GLOSSARY ENTRY, YOU MUST USE THE SPECIFIED {tgt_upper} TERM **WITHOUT CHANGES OR REPLACEMENTS**.
 - **USE** the provided context passages to align with the established terminology, phrasing, and stylistic norms.
-- **ALWAYS PRESERVE** the full meaning, scope, and nuances of the {src_upper} source text.
+- **ALWAYS PRESERVE** the full meaning and scope of the source text.
 - **STRICTLY NEVER CHANGE** numbers, ranges, torque values, units, part numbers, error codes, abbreviations, IDs, or technical references unless correcting a 100% CLEAR mistake.
+- **STRICTLY ALWAYS PROVIDE YOUR OUTPUT IN {tgt_upper}**. NEVER REVERT THE TRANSLATION BACK TO THE SOURCE LANGUAGE {src_upper}.
+- **PROPER NOUNS**: Proper nouns like names and locations MUST ALSO be translated or transcribed into {tgt_upper} unless it's a globally recognized trademark where English is preferred (like Apple, Google). Do NOT leave them in English if they can be transcribed.
 - **ALWAYS MAINTAIN** a professional, neutral, technical tone.{extra_rules}
 - **KEEP THE FOLLOWING PLACEHOLDERS EXACTLY AS THEY ARE - STRICTLY NEVER CHANGE OR SHIFT THESE**:
     - `[[INLINE0]]`, `[[BLOCK0]]`, `[[BLOCK1]]`, [L1], [/L1], [L2], [/L2], etc.
+- **CRITICAL: DO NOT merge content between different '[L#]' tags**. Every [L#] tag provided in the input MUST exist in the output with its corresponding line's content. Do not combine L1 and L2 into one block.
 
 ## **OUTPUT REQUIREMENT**
 
@@ -68,9 +71,10 @@ YOU MUST:
 - **STRICTLY APPLY** the glossary:
     - IF A TERM IN THE {src_upper} SOURCE TEXT EXACTLY MATCHES A GLOSSARY ENTRY, YOU MUST USE THE SPECIFIED {tgt_upper} TERM **WITHOUT CHANGES OR REPLACEMENTS**.
 - **USE** the provided context passages to align with the established terminology, phrasing, and stylistic norms.
-- **ALWAYS PRESERVE** the full meaning, scope, and nuances of the {src_upper} source text.
-- **STRICTLY NEVER CHANGE** numbers, ranges, torque values, units, part numbers, error codes, abbreviations, IDs, or technical references unless correcting a 100% CLEAR mistake.
+- **STRICTLY ALWAYS PROVIDE YOUR OUTPUT IN {tgt_upper}**. NEVER REVERT THE TRANSLATION BACK TO THE SOURCE LANGUAGE {src_upper} (e.g., if the current translation is in Japanese Katakana, do NOT change it back to English).
+- **PROPER NOUNS**: Company names, organization names, and geographic locations (e.g. Gurugram, India) MUST be translated or transcribed into {tgt_upper} (e.g. using Katakana in Japanese) unless it's a globally recognized trademark where English is preferred (like Apple, Google). Do NOT leave them in English if they can be transcribed.
 - **ALWAYS MAINTAIN** a professional, neutral, technical tone.{extra_rules}
+- **CRITICAL: DO NOT merge content between different '[L#]' tags**. Every [L#] tag provided in the input MUST exist in the output with its corresponding line's content. Do not combine L1 and L2 into one block.
 
 ## **OUTPUT REQUIREMENT**
 

@@ -1138,62 +1138,89 @@ def _merge_paragraph_groups(
                 seen_gids.add(gid)
             group_items.setdefault(gid, []).append(idx)
 
-    merged_containers: List[ContainerRef] = []
-    merge_map: List[_MergeEntry] = []
-
+    # Post-process groups: split if there's a large vertical gap between lines
+    final_merged_containers: List[ContainerRef] = []
+    final_merge_map: List[_MergeEntry] = []
     merged_count = 0
+
     for gid in group_order:
         indices = group_items[gid]
-
-        if len(indices) == 1:
-            # Singleton – pass through unchanged
+        if len(indices) <= 1:
+            # Singleton – pass through
             c = containers[indices[0]]
-            merged_containers.append(c)
-            merge_map.append(_MergeEntry(
+            final_merged_containers.append(c)
+            final_merge_map.append(_MergeEntry(
                 original_indices=indices,
                 line_count=1,
                 merged_container=c,
             ))
-        else:
-            # Multi-line paragraph – build delimited text
-            parts: List[str] = []
-            bboxes: List[Tuple[float, float, float, float]] = []
-            for line_num, ci in enumerate(indices, start=1):
-                parts.append(f"[L{line_num}]{containers[ci].text}[/L{line_num}]")
-                bboxes.append(containers[ci].bbox)
+            continue
 
-            merged_text = "".join(parts)
-            print(f"Merging group gid={gid}: lines={len(indices)}, indices={indices},\nmerged_text={_preview_text(merged_text)}\n")
-            merged_bbox = _union_bbox(bboxes)
+        # Split group if vertical gaps are too large or line count is massive
+        sub_groups: List[List[int]] = []
+        current_sub: List[int] = [indices[0]]
+        for i in range(1, len(indices)):
+            prev = containers[indices[i-1]]
+            curr = containers[indices[i]]
+            # Vertical gap heuristic: 1.5x line height or 20pt, whichever is smaller context
+            # (or if they are on different pages)
+            prev_h = prev.bbox[3] - prev.bbox[1]
+            gap = curr.bbox[1] - prev.bbox[3]
+            
+            # Massive gap or page break or too many lines (to keep context manageable)
+            if curr.page_index != prev.page_index or gap > max(15.0, prev_h * 1.5) or len(current_sub) >= 20:
+                sub_groups.append(current_sub)
+                current_sub = [indices[i]]
+            else:
+                current_sub.append(indices[i])
+        sub_groups.append(current_sub)
 
-            # Use the first line's metadata for the virtual container
-            first = containers[indices[0]]
-            virtual = ContainerRef(
-                page_index=first.page_index,
-                bbox=merged_bbox,
-                text=merged_text,
-                kind=first.kind,
-                polygon=first.polygon,
-                reading_key=first.reading_key,
-                style_hints=first.style_hints,
-                original_spans=[], # spans stay on the real per-line containers
-                paragraph_group_id=first.paragraph_group_id,
-            )
+        for sub_indices in sub_groups:
+            if len(sub_indices) == 1:
+                # Became singleton
+                c = containers[sub_indices[0]]
+                final_merged_containers.append(c)
+                final_merge_map.append(_MergeEntry(
+                    original_indices=sub_indices,
+                    line_count=1,
+                    merged_container=c,
+                ))
+            else:
+                # Multi-line
+                parts: List[str] = []
+                bboxes: List[Tuple[float, float, float, float]] = []
+                for line_num, ci in enumerate(sub_indices, start=1):
+                    parts.append(f"[L{line_num}]{containers[ci].text}[/L{line_num}]")
+                    bboxes.append(containers[ci].bbox)
 
-            merged_containers.append(virtual)
-            merge_map.append(_MergeEntry(
-                original_indices=indices,
-                line_count=len(indices),
-                merged_container=virtual,
-            ))
-            merged_count += 1
+                merged_text = "".join(parts)
+                merged_bbox = _union_bbox(bboxes)
+                first = containers[sub_indices[0]]
+                virtual = ContainerRef(
+                    page_index=first.page_index,
+                    bbox=merged_bbox,
+                    text=merged_text,
+                    kind=first.kind,
+                    polygon=first.polygon,
+                    reading_key=first.reading_key,
+                    style_hints=first.style_hints,
+                    original_spans=[],
+                    paragraph_group_id=first.paragraph_group_id,
+                )
+                final_merged_containers.append(virtual)
+                final_merge_map.append(_MergeEntry(
+                    original_indices=sub_indices,
+                    line_count=len(sub_indices),
+                    merged_container=virtual,
+                ))
+                merged_count += 1
 
     _vprint(
         verbose,
-        f"[MERGE] {len(containers)} containers -> {len(merged_containers)} "
-        f"({merged_count} paragraph groups merged)",
+        f"[MERGE] {len(containers)} containers -> {len(final_merged_containers)} "
+        f"({merged_count} splits/merges created)",
     )
-    return merged_containers, merge_map
+    return final_merged_containers, final_merge_map
 
 
 def _unmerge_paragraph_translations(
@@ -1245,11 +1272,12 @@ def _unmerge_paragraph_translations(
                     f"parsed {n}/{n} line tags OK")
         else:
             # Fallback: delimiters missing or corrupted
-            # Strip any surviving tags and distribute text evenly across lines
-            clean = _LINE_TAG_RE.sub("", raw).strip()
+            # Strip ANY remaining tags (even unpaired/malformed ones) before splitting
+            # to prevent [L5] etc. from leaking into the final text.
+            clean = re.sub(r"\[/?L\d+\]", "", raw).strip()
             if not clean:
                 clean = raw  # if stripping removed everything, keep raw
-
+            
             _vprint(verbose, f"[UNMERGE][FALLBACK] group gid={entry.merged_container.paragraph_group_id}: "
                     f"expected {n} tags, found {len(parsed)}. Using proportional split.")
 
@@ -1368,9 +1396,22 @@ def translate_pdf_bytes_pipeline(
     norm_states = []
     policies = []
 
+    # Track placeholder counters per paragraph group to ensure uniqueness across full context
+    group_counters = {} 
+    group_all_placeholders = {} # gid -> {ph: token}
+
     for i, c in enumerate(orig_containers):
         # 7.2 Protected-token integrity (part of normalization)
-        norm_text, state = apply_normalization_pipeline(c.text)
+        gid = c.paragraph_group_id or f"__auto_{i}"
+        start_ph = group_counters.get(gid, 0)
+        
+        norm_text, state, next_ph = apply_normalization_pipeline(c.text, start_counter=start_ph)
+        group_counters[gid] = next_ph
+        
+        # Aggregate placeholders for restoration (so migration between lines within a group is fine)
+        if gid not in group_all_placeholders:
+            group_all_placeholders[gid] = {}
+        group_all_placeholders[gid].update(state.placeholders)
         
         # 8.3 Kind-aware classification
         policy = classify_container(c)
@@ -1421,9 +1462,12 @@ def translate_pdf_bytes_pipeline(
         # Stage 4: Restore & Map to Plans (Step 7.2 integrity)
         trans_idx = 0
         plans = []
+        from scripts.text_normalization.normalizer import NormalizationState
+
         for i, c in enumerate(orig_containers):
             policy = policies[i]
             norm_state = norm_states[i]
+            gid = c.paragraph_group_id or f"__auto_{i}"
             
             if policy == TranslationPolicy.SKIP:
                 trans_text = c.text
@@ -1432,7 +1476,12 @@ def translate_pdf_bytes_pipeline(
                 trans_idx += 1
             
             # Step 7.2: Final restoration of placeholders
-            final_txt = restore_protected_tokens(trans_text, norm_state)
+            # Use aggregated placeholders for the group so placeholders migrated by LLM are still restored
+            combined_placeholders = group_all_placeholders.get(gid, norm_state.placeholders)
+            # Create a shallow state for restoration that covers the whole paragraph group
+            restoration_state = NormalizationState(original_text=norm_state.original_text, placeholders=combined_placeholders)
+            
+            final_txt = restore_protected_tokens(trans_text, restoration_state)
             
             # Build rendering intent (Step 8 basics)
             intent = RenderingIntent(

@@ -217,8 +217,10 @@ def _llm1_refine(
         "Task: IMPROVE the provided machine translation so it is GRAMMATICALLY CORRECT, FLUENT, and FAITHFUL.",
         "STRICT RULES TO FOLLOW:",
         " - ALWAYS PRESERVE the meaning of the original text EXACTLY.",
+        " - PROPER NOUNS: Company names, organization names, and geographic locations (e.g. Gurugram, India) MUST be translated or transcribed into the target language (e.g. using Katakana in Japanese) unless it's a globally recognized trademark where English is preferred (like Apple, Google). Do NOT leave them in English if they have a target language equivalent or can be transcribed.",
         " - ALWAYS PRESERVE numbers, units, codes, part numbers, and tokens like '[[INLINE#]]' and '[[BLOCK#]]' EXACTLY.",
-        " - ALWAYS PRESERVE tokens like '[L#]' and '[/L#]' which indicate line breaks in the original PDF. Do not add or remove them, and keep them in the same position relative to the text."
+        " - ALWAYS PRESERVE tokens like '[L#]' and '[/L#]' which indicate line breaks in the original PDF. Do not add or remove them, and keep them in the same position relative to the text.",
+        " - CRITICAL: DO NOT merge content between different '[L#]' tags. Every [L#] tag provided in the input MUST exist in the output with its corresponding line's content. Do not combine L5 and L6 into one block.",
         " - NEVER add extra commentary or chat.",
     ]
     

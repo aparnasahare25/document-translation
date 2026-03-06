@@ -299,8 +299,20 @@ def typeset_and_insert(
         return False
 
     # ── Span-based path: precise origin insertion ──
-    # Bypass exact-origin placement for table cells so they can reflow inside their full bbox
-    if plan.container.original_spans and plan.container.kind != ContainerKind.TABLE_CELL:
+    # Bypass exact-origin placement for table cells so they can reflow inside their full bbox.
+    # ALSO bypass for singleton paragraphs/list items so they can wrap/reflow if the translation is long.
+    use_spans = False
+    if plan.container.original_spans:
+        kind = plan.container.kind
+        if kind == ContainerKind.TABLE_CELL:
+            use_spans = False
+        elif kind in (ContainerKind.PARAGRAPH, ContainerKind.LIST_ITEM):
+            # Only use strict spans for prose if it was already multi-line in the original
+            use_spans = len(plan.container.original_spans) > 1
+        else:
+            use_spans = True
+
+    if use_spans:
         ok = typeset_and_insert_spans(page, plan, font_map)
         if ok:
             return True
@@ -316,11 +328,19 @@ def typeset_and_insert(
         
     cjk_mode = _looks_cjk(text)
     r_obj = fitz.Rect(rect)
-    max_w = max(1.0, r_obj.width - 0.2)
-    lineheight_factor = 1.15
     
     # Kind-aware policy bindings
     kind = plan.container.kind
+    
+    # Apply vertical slack for prose to avoid aggressive shrinking/truncation
+    if kind in (ContainerKind.PARAGRAPH, ContainerKind.LIST_ITEM):
+        # Allow expansion downwards by up to 60% of original height or 30pt
+        # This gives the translation room to wrap instead of becoming tiny.
+        r_obj.y1 += min(30.0, r_obj.height * 0.6)
+
+    max_w = max(1.0, r_obj.width - 0.2)
+    lineheight_factor = 1.12
+    
     align = intent.alignment
     fs = max(5.0, intent.font_size_start)
     min_fontsize = 4.0

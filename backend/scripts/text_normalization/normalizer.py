@@ -17,7 +17,8 @@ CJK_RANGE = r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]'
 URL_EMAIL_RE = r'\b(?:https?://|www\.)\S+\b|\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
 FILE_PATH_RE = r'(?:/[a-zA-Z0-9_.-]+)+/?|[A-Z]:\\[a-zA-Z0-9_.-\\]+'
 PART_NUMBER_RE = r'\b[A-Z0-9]+-(?:[A-Z0-9]+-)*[A-Z0-9]+\b|\b[A-Z]+\d+[A-Z0-9]*\b|\b\d+[A-Z]+[A-Z0-9]*\b|\b\d{5,12}\b'
-COMMON_WORDS = "THE|AND|FOR|NOT|BUT|ARE|YOU|CAN|HAS|HIS|HER|WAS|ALL|ANY|OUT|HOW|WHO|THIS|THAT|WITH|FROM"
+# Common keywords/titles that should NOT be protected as acronyms (ensure they get translated)
+COMMON_WORDS = "THE|AND|FOR|NOT|BUT|ARE|YOU|CAN|HAS|HIS|HER|WAS|ALL|ANY|OUT|HOW|WHO|THIS|THAT|WITH|FROM|SKILLS|EDUCATION|EXPERIENCE|PROJECTS|SUMMARY|CONTACT|PROFILE|ABOUT|WORK|INFO|PAGE"
 ACRONYM_RE = rf'\b(?!(?:{COMMON_WORDS})\b)[A-Z]{{3,7}}\b'
 MEASUREMENT_RE = r'\b\d+(?:\.\d+)?\s*(?:mm|cm|m|km|kg|g|mg|l|ml|V|A|Hz|W|kW|MPa|psi|°C|°F|%)\b'
 UI_MARKER_RE = r'[▶▸■◆●➔➞►▼▲☑☐☒]'
@@ -43,9 +44,9 @@ def script_aware_despace(text: str) -> str:
     text = re.sub(pattern, r'\1\2', text)
     return text
 
-def extract_protected_tokens(text: str) -> Tuple[str, Dict[str, str]]:
+def extract_protected_tokens(text: str, start_counter: int = 0) -> Tuple[str, Dict[str, str], int]:
     placeholders = {}
-    counter = 0
+    counter = start_counter
 
     def repl(match):
         nonlocal counter
@@ -59,14 +60,14 @@ def extract_protected_tokens(text: str) -> Tuple[str, Dict[str, str]]:
         return ph
 
     new_text = PROTECTED_COMBINED_RE.sub(repl, text)
-    return new_text, placeholders
+    return new_text, placeholders, counter
 
-def apply_normalization_pipeline(text: str) -> Tuple[str, NormalizationState]:
+def apply_normalization_pipeline(text: str, start_counter: int = 0) -> Tuple[str, NormalizationState, int]:
     norm_text = normalize_whitespace(text)
     norm_text = script_aware_despace(norm_text)
-    ph_text, placeholders = extract_protected_tokens(norm_text)
+    ph_text, placeholders, next_counter = extract_protected_tokens(norm_text, start_counter=start_counter)
     
-    return ph_text, NormalizationState(original_text=text, placeholders=placeholders)
+    return ph_text, NormalizationState(original_text=text, placeholders=placeholders), next_counter
 
 def restore_protected_tokens(translated_text: str, state: NormalizationState) -> str:
     restored = translated_text
