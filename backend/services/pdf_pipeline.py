@@ -157,15 +157,6 @@ def _print_translation_samples(
         print(f"  [Final sample #{i}] translated: {_preview_text(bt.final_rendered_text, 180)}")
 
 
-def _fmt_float(x: Optional[float], nd: int = 2) -> str:
-    if x is None:
-        return "None"
-    try:
-        return f"{float(x):.{nd}f}"
-    except Exception:
-        return str(x)
-
-
 def _print_timing_report(
     *,
     verbose: bool,
@@ -233,22 +224,6 @@ def _print_timing_report(
     print(f"  Apply translations   : {apply_time:.2f}")
     print(f"  Save PDF             : {save_time:.2f}")
     print(f"  Total pipeline       : {total_time:.2f}")
-
-
-# -----------------------------
-# Data models
-# -----------------------------
-@dataclass(frozen=True)
-class BlockRef:
-    page_index: int
-    bbox: Tuple[float, float, float, float] # fitz coords (points)
-    text: str
-
-
-@dataclass(frozen=True)
-class BlockTranslation:
-    block: BlockRef
-    translated_text: str
 
 
 # -----------------------------
@@ -644,23 +619,6 @@ def _extract_items_from_docintel_result(doc: fitz.Document, analyze_result, *, v
     return items
 
 
-def _extract_blocks_from_docintel_result(
-    doc: fitz.Document,
-    analyze_result,
-    *,
-    verbose: bool = False,
-) -> List[BlockRef]:
-    """
-    Now extracts semantic units:
-        - table cells
-        - paragraphs (multi-line kept together by DI)
-    """
-    items = _extract_items_from_docintel_result(doc, analyze_result, verbose=verbose)
-    blocks = [BlockRef(page_index=it.page_index, bbox=it.bbox, text=it.text) for it in items]
-    _vprint(verbose, f"[EXTRACT] Converted extracted items -> BlockRef list (count={len(blocks)})")
-    return blocks
-
-
 def extract_all_blocks(pdf_bytes: bytes, *, verbose: bool = False) -> Tuple[fitz.Document, List[ContainerRef], Dict[str, Any]]:
     """
     Opens the PDF (for writing later) and extracts text blocks using Azure Document Intelligence.
@@ -798,22 +756,6 @@ def _estimate_fontsize_for_rect(page: fitz.Page, rect: fitz.Rect, *, verbose: bo
         if acc >= total / 2.0:
             return math.floor(float(sz))
     return math.floor(float(cand[-1][0]))
-
-
-def _guess_align_for_rect(page: fitz.Page, rect: fitz.Rect) -> int:
-    """
-    Heuristic alignment:
-        - center if near page center and not too wide (titles)
-        - right if in right column
-        - else left
-    """
-    pw = float(page.rect.width)
-    cx = (rect.x0 + rect.x1) / 2.0
-    if abs(cx - pw / 2.0) < pw * 0.08 and rect.width < pw * 0.75:
-        return fitz.TEXT_ALIGN_CENTER
-    if rect.x0 > pw * 0.55:
-        return fitz.TEXT_ALIGN_RIGHT
-    return fitz.TEXT_ALIGN_LEFT
 
 
 def _get_font_buffer(fontfile: str, *, verbose: bool = False) -> Optional[bytes]:
@@ -1067,158 +1009,6 @@ def _truncate_lines_to_height(
         last = last[:-1]
     out[-1] = (last + ell) if last else ell
     return out
-
-
-def _fit_and_insert_textbox(
-    page: fitz.Page,
-    rect: fitz.Rect,
-    text: str,
-    *,
-    fontname: str,
-    fontfile: Optional[str],
-    start_fontsize: float,
-    min_fontsize: float = 5.0,
-    align: int = fitz.TEXT_ALIGN_LEFT,
-    verbose: bool = False,
-) -> bool:
-    """
-    Robust textbox insertion:
-        - Register font
-        - Wrap CJK ourselves (character wrap) so insert_textbox doesn't fail
-        - Try font sizes downwards until Shape.insert_textbox succeeds
-        - Final fallback: insert_text (never fails) with our pre-wrapped lines
-    """
-    t = (text or "").strip()
-    if not t:
-        _vprint(verbose, f"[APPLY][TEXTBOX] Empty text for rect={rect}; skipping insert")
-        return False
-
-    _ensure_page_font(page, fontname, fontfile, verbose=verbose)
-
-    # if font registration worked, we can use fontname-only;
-    # if it didn't, passing fontfile is a safe fallback
-    use_fontfile = None  # prefer registered font
-    mf = _get_measure_font(fontname, fontfile, verbose=verbose)
-    cjk_mode = _looks_cjk(t)
-
-    max_w = max(1.0, rect.width - 0.2)
-    _vprint(verbose, f"[APPLY][TEXTBOX] Max width for text in rect (rect.width={rect.width}): {max_w:.2f}")
-    lineheight_factor = 1.19
-
-    fs = float(max(min_fontsize, start_fontsize))
-    attempt = 0
-
-    while fs >= min_fontsize - 1e-6:
-        if attempt > 25:
-            _vprint(verbose, f"[APPLY][TEXTBOX] Too many attempts for page={page.number}, rect={_fmt_bbox((rect.x0, rect.y0, rect.x1, rect.y1))}; giving up")
-            fs = 5.0 # safety break to avoid infinite loop
-            break
-        attempt += 1
-
-        # Wrap (NO truncation here)
-        raw_lines = _wrap_text_to_width(t, mf, fs, max_w, cjk_mode=cjk_mode)
-        wrapped = "\n".join(raw_lines).strip()
-
-        # fast path: if we obviously have too many lines for the available height, shrink fontsize more aggressively (avoiding lots of 0.5 steps)
-        max_lines_possible = max(1, int(rect.height / (fs * lineheight_factor)))
-        if len(raw_lines) > max_lines_possible:
-            # estimate next font size that could fit these lines (conservative)
-            fs_est = rect.height / (len(raw_lines) * lineheight_factor)
-            new_fs = max(min_fontsize, min(fs - 0.5, fs_est))
-            _vprint(
-                verbose,
-                f"[APPLY][TEXTBOX] page={page.number} attempt={attempt} fs={fs:.2f} "
-                f"lines={len(raw_lines)} > max_lines={max_lines_possible} so estimated font-size that fits: {fs_est}; shrinking -> {new_fs:.2f}"
-            )
-            fs = new_fs
-            continue
-
-        shape = page.new_shape()
-        try:
-            rc = shape.insert_textbox(
-                rect,
-                wrapped,
-                fontname=fontname,
-                fontfile=use_fontfile, # rely on registered font
-                fontsize=fs,
-                color=(0, 0, 0),
-                align=align,
-                lineheight=lineheight_factor,
-                set_simple=False,
-                encoding=0,
-            )
-        except Exception as e:
-            # fallback: try passing fontfile directly if fontname-only path fails
-            shape = page.new_shape()
-            rc = shape.insert_textbox(
-                rect,
-                wrapped,
-                fontname=fontname,
-                fontfile=fontfile,
-                fontsize=fs,
-                color=(0, 0, 0),
-                align=align,
-                lineheight=lineheight_factor,
-                set_simple=False,
-                encoding=0,
-            )
-            _vprint(verbose, f"[APPLY][TEXTBOX] fontname-only failed; retried with fontfile: {e!r}")
-
-        _vprint(
-            verbose,
-            f"[APPLY][TEXTBOX] page={page.number}, attempt={attempt}, fs={fs:.2f}, "
-            f"lines={len(raw_lines)}, rc={rc}, rect={_fmt_bbox((rect.x0, rect.y0, rect.x1, rect.y1))}",
-        )
-
-        if isinstance(rc, (int, float)) and rc >= 0:
-            shape.commit(overlay=True)
-            _vprint(verbose, f"[APPLY][TEXTBOX] success (page={page.number}, fs={fs:.2f})")
-            return True
-
-        fs -= 0.5
-
-    # ----- final fallback at min_fontsize: truncate to height -----
-    fs = float(min_fontsize)
-    max_lines = max(1, int(rect.height / (fs * lineheight_factor)))
-    raw_lines = _wrap_text_to_width(t, mf, fs, max_w, cjk_mode=cjk_mode)
-    lines = _truncate_lines_to_height(raw_lines, mf, fs, max_w, max_lines) # only truncate here
-    wrapped = "\n".join(lines).strip()
-
-    shape = page.new_shape()
-    rc = shape.insert_textbox(
-        rect,
-        wrapped,
-        fontname=fontname,
-        fontfile=use_fontfile,
-        fontsize=fs,
-        color=(0, 0, 0),
-        align=align,
-        lineheight=lineheight_factor,
-        set_simple=False,
-        encoding=0,
-    )
-    if isinstance(rc, (int, float)) and rc >= 0:
-        shape.commit(overlay=True)
-        _vprint(verbose, f"[APPLY][TEXTBOX] truncated fallback success (page={page.number}, fs={fs:.2f})")
-        return True
-
-    # worst-case: ensure *something* is visible
-    start_pt = fitz.Point(rect.x0, rect.y0 + fs)
-    shape = page.new_shape()
-    shape.insert_text(
-        start_pt,
-        lines,
-        fontname=fontname,
-        fontfile=use_fontfile,
-        fontsize=fs,
-        color=(0, 0, 0),
-        lineheight=lineheight_factor,
-        set_simple=False,
-        encoding=0,
-    )
-    shape.commit(overlay=True)
-    _vprint(verbose, f"[APPLY][TEXTBOX] insert_text worst-case fallback used (page={page.number})")
-    return True
 
 
 def remove_text(page: fitz.Page, rects: List[fitz.Rect], pix: fitz.Pixmap, verbose: bool = False):
