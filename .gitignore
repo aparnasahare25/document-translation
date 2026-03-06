@@ -2,6 +2,7 @@
 data/
 extra/
 output/
+logs/
 
 # Environment / secrets
 .env

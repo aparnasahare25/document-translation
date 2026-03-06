@@ -32,6 +32,11 @@ def _bidirectional_shape(text: str) -> str:
     return text
 
 def _wrap_text_to_width(text: str, font: fitz.Font, fontsize: float, max_width: float, cjk_mode: bool) -> List[str]:
+    """
+    Produce explicit line breaks so that each line width <= max_width.
+    - For CJK: wrap by characters (with a small ASCII-run exception).
+    - For non-CJK: wrap by whitespace with fallback to char-wrap for very long tokens.
+    """
     lines = []
     def w(s: str) -> float:
         return float(font.text_length(s, fontsize=fontsize))
@@ -120,9 +125,13 @@ def _wrap_text_to_width(text: str, font: fitz.Font, fontsize: float, max_width: 
                 
     while lines and lines[-1] == "":
         lines.pop()
+    print(f"Wrapped text to width: max_width={max_width}, original_len={len(text)}, lines={len(lines)}")
     return lines
 
 def _truncate_lines_to_height(lines: List[str], font: fitz.Font, fontsize: float, max_width: float, max_lines: int) -> List[str]:
+    """
+    Ensure at most max_lines. If truncated, add ellipsis to last line.
+    """
     if max_lines <= 0: return []
     if len(lines) <= max_lines: return lines
     out = lines[:max_lines]
@@ -131,6 +140,7 @@ def _truncate_lines_to_height(lines: List[str], font: fitz.Font, fontsize: float
     while last and float(font.text_length(last + ell, fontsize=fontsize)) > max_width:
         last = last[:-1]
     out[-1] = (last + ell) if last else ell
+    print(f"Truncating to height: max_lines={max_lines}, original_lines={len(lines)}, truncated_lines={len(out)}")
     return out
 
 def _int_to_rgb(color_int: int):

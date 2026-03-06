@@ -16,7 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 import os, json, time, requests, re, threading, random
-from typing import List, Dict, Optional, Callable, Any
+from typing import List, Dict, Optional, Callable, Any, Union
 
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
@@ -539,7 +539,8 @@ def refine_segment_with_glossary(
     source_lang: Optional[str] = None,
     target_lang: Optional[str] = None,
     is_short_mode: bool = False,
-) -> str:
+    return_full_info: bool = False,
+) -> Union[str, Dict[str, Any]]:
     """
     Main API:
 
@@ -549,22 +550,16 @@ def refine_segment_with_glossary(
 
     Output:
         - final ultra-refined target-language paragraph string
+        - OR a dictionary if return_full_info=True
 
     OPTIONAL KWARGS:
         - target_lang: used to filter 'lang' in glossary index (e.g. "de", "fr")
-
-    If not provided, falls back to env default:
-        - RAG_LANG (or none -> no filter)
     """
     if verbose:
         _step("REFINING SINGLE SEGMENT")
         _print_kv("English Preview", _preview(english_chunk, 250))
         _print_kv("Current Translation Preview", _preview(current_translation, 250))
 
-    # Effective lang scope:
-    # - if target_lang passed -> normalize "de-DE" -> "de"
-    # - else use env RAG_LANG_DEFAULT
-    # - else None => unfiltered
     lang_eff = None
     if target_lang is not None:
         tl = (target_lang or "").strip()
@@ -604,4 +599,12 @@ def refine_segment_with_glossary(
 
     if RETRY_COUNT["retry_counter"] != 0 and RETRY_COUNT["retry_counter"] % 5 == 0:
         print(f"[RETRY-WASTE] {RETRY_COUNT['retry_counter']} retries - wasted {RETRY_COUNT['retry_time_wasted']} seconds.")
+    
+    if return_full_info:
+        top_hit = glossary_paragraphs[0].get("content", "") if glossary_paragraphs else ""
+        return {
+            "final_translation": final_tl,
+            "top_glossary_hit": top_hit
+        }
+    
     return final_tl

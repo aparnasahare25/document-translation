@@ -30,6 +30,7 @@ from scripts.layout.geometry import (
     bbox_area as _bbox_area,
 )
 from scripts.text_normalization.normalizer import apply_normalization_pipeline, restore_protected_tokens
+from services.logger import get_logger
 
 
 # -----------------------------
@@ -144,8 +145,8 @@ def _print_translation_samples(
                 dst = pair.get("translated") or pair.get("output") or pair.get("llm1_output") or ""
             elif isinstance(pair, (tuple, list)) and len(pair) >= 2: src, dst = pair[0], pair[1]
             else: continue
-            print(f"  [LLM-1 sample #{i}] original  : {_preview_text(str(src), 180)}")
-            print(f"  [LLM-1 sample #{i}] translated: {_preview_text(str(dst), 180)}")
+            print(f"  [LLM-1 sample #{i}] original  : {_preview_text(str(src), 400)}")
+            print(f"  [LLM-1 sample #{i}] translated: {_preview_text(str(dst), 400)}\n")
         return
 
     # fallback if translation_service doesn't expose LLM-1 diagnostics
@@ -894,123 +895,6 @@ def _get_measure_font(fontname: str, fontfile: Optional[str], *, verbose: bool =
         return f
 
 
-_ASCII_RUN_RE = re.compile(r"[A-Za-z0-9]+")
-def _wrap_text_to_width(
-    text: str,
-    font: fitz.Font,
-    fontsize: float,
-    max_width: float,
-    *,
-    cjk_mode: bool,
-) -> List[str]:
-    """
-    Produce explicit line breaks so that each line width <= max_width.
-    - For CJK: wrap by characters (with a small ASCII-run exception).
-    - For non-CJK: wrap by whitespace with fallback to char-wrap for very long tokens.
-    """
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-
-    def w(s: str) -> float:
-        return float(font.text_length(s, fontsize=fontsize))
-
-    lines: List[str] = []
-    for para in text.split("\n"):
-        if not para.strip():
-            lines.append("") # preserve blank line
-            continue
-
-        if cjk_mode:
-            # tokenize: keep ASCII runs intact, otherwise per-character
-            tokens: List[str] = []
-            i = 0
-            while i < len(para):
-                m = _ASCII_RUN_RE.match(para, i)
-                if m:
-                    tokens.append(m.group(0))
-                    i = m.end()
-                    continue
-                tokens.append(para[i])
-                i += 1
-
-            cur = ""
-            for tok in tokens:
-                # avoid starting a line with spaces
-                if not cur and tok.isspace():
-                    continue
-                cand = cur + tok
-                if not cur or w(cand) <= max_width:
-                    cur = cand
-                else:
-                    lines.append(cur.rstrip())
-                    cur = tok.lstrip() if tok.isspace() else tok
-            if cur:
-                lines.append(cur.rstrip())
-        else:
-            # word wrap by whitespace; fallback to char wrap for very long words.
-            words = re.split(r"(\s+)", para) # keep spaces as tokens
-            cur = ""
-            for tok in words:
-                if tok == "":
-                    continue
-                if not cur and tok.isspace():
-                    continue
-                cand = cur + tok
-                if not cur or w(cand) <= max_width:
-                    cur = cand
-                    continue
-
-                # if token itself is too wide, break it
-                if w(tok) > max_width:
-                    if cur:
-                        lines.append(cur.rstrip())
-                        cur = ""
-                    # char-wrap the token
-                    buf = ""
-                    for ch in tok:
-                        cand2 = buf + ch
-                        if not buf or w(cand2) <= max_width:
-                            buf = cand2
-                        else:
-                            lines.append(buf.rstrip())
-                            buf = ch
-                    cur = buf
-                else:
-                    lines.append(cur.rstrip())
-                    cur = tok.lstrip() if tok.isspace() else tok
-            if cur:
-                lines.append(cur.rstrip())
-
-    # remove trailing empty lines created by splitting
-    while lines and lines[-1] == "":
-        lines.pop()
-    return lines
-
-
-def _truncate_lines_to_height(
-    lines: List[str],
-    font: fitz.Font,
-    fontsize: float,
-    max_width: float,
-    max_lines: int,
-) -> List[str]:
-    """
-    Ensure at most max_lines. If truncated, add ellipsis to last line.
-    """
-    if max_lines <= 0:
-        return []
-    if len(lines) <= max_lines:
-        return lines
-
-    out = lines[:max_lines]
-    last = out[-1]
-    ell = "…"
-    # shrink last line until it fits with ellipsis
-    while last and float(font.text_length(last + ell, fontsize=fontsize)) > max_width:
-        last = last[:-1]
-    out[-1] = (last + ell) if last else ell
-    return out
-
-
 def remove_text(page: fitz.Page, rects: List[fitz.Rect], pix: fitz.Pixmap, verbose: bool = False):
     """
     9.3 removal strategy: text-only removal avoiding background nuke.
@@ -1279,6 +1163,7 @@ def _merge_paragraph_groups(
                 bboxes.append(containers[ci].bbox)
 
             merged_text = "".join(parts)
+            print(f"Merging group gid={gid}: lines={len(indices)}, indices={indices},\nmerged_text={_preview_text(merged_text)}\n")
             merged_bbox = _union_bbox(bboxes)
 
             # Use the first line's metadata for the virtual container
@@ -1291,7 +1176,7 @@ def _merge_paragraph_groups(
                 polygon=first.polygon,
                 reading_key=first.reading_key,
                 style_hints=first.style_hints,
-                original_spans=[],  # spans stay on the real per-line containers
+                original_spans=[], # spans stay on the real per-line containers
                 paragraph_group_id=first.paragraph_group_id,
             )
 
@@ -1393,7 +1278,7 @@ def _unmerge_paragraph_translations(
     return expanded
 
 
-def _normalize_translate_blocks_result(result) -> Tuple[List[BlockTranslation], Dict[str, Any]]:
+def _normalize_translate_blocks_result(result) -> Tuple[List, Dict[str, Any]]:
     """
     Accept multiple return shapes from services.translation_service.translate_blocks
     """
@@ -1455,7 +1340,8 @@ def translate_pdf_bytes_pipeline(
     *, 
     source_lang: Optional[str] = None, 
     target_lang: Optional[str] = None, 
-    verbose: bool = False
+    verbose: bool = False,
+    filename: str = "document.pdf"
 ) -> bytes:
     """
     Step 7 & 8: High-fidelity container-based translation pipeline.
@@ -1466,6 +1352,9 @@ def translate_pdf_bytes_pipeline(
     errors = 0
 
     _vprint(verbose, f"[PIPELINE] Starting PDF Translation | {source_lang} -> {target_lang}...")
+
+    logger = get_logger()
+    logger.start_file_session(filename)
 
     # Stage 1: Container-first Extraction (Step 7.1)
     t0 = time.perf_counter()
@@ -1563,6 +1452,58 @@ def translate_pdf_bytes_pipeline(
             )
             plans.append(plan)
 
+        # --- Logging Stage ---
+        # Build mapping to merged diagnostics
+        # original_idx -> merged_idx
+        orig_to_merged = {}
+        for midx, entry in enumerate(merge_map):
+            for oidx_in_subset in entry.original_indices:
+                orig_idx = translate_idx_map[oidx_in_subset]
+                orig_to_merged[orig_idx] = midx
+
+        # merged_idx -> debug_info
+        llm1_map = {p["index"]: p for p in diagnostics.get("llm1_pairs", [])}
+        llm2_map = {p["index"]: p for p in diagnostics.get("llm2_pairs", [])}
+
+        for i, c in enumerate(orig_containers):
+            policy = policies[i]
+            plan = plans[i]
+            
+            if policy == TranslationPolicy.SKIP:
+                logger.log_entry(
+                    source_text=c.text,
+                    skipped=True,
+                    skip_reason="Policy SKIP (mostly non-textual or layout restriction)"
+                )
+            else:
+                midx = orig_to_merged.get(i)
+                merged_src = ""
+                mt_text = ""
+                llm1_text = ""
+                llm2_text = ""
+                gloss_hit = ""
+                
+                if midx is not None:
+                    # Delimited versions from diagnostics
+                    d1 = llm1_map.get(midx, {})
+                    d2 = llm2_map.get(midx, {})
+                    merged_src = d1.get("original") or d2.get("original") or ""
+                    mt_text = d1.get("mt", "")
+                    llm1_text = d1.get("translated", "")
+                    llm2_text = d2.get("translated", "")
+                    gloss_hit = d2.get("glossary_hit", "")
+
+                logger.log_entry(
+                    source_text=c.text,
+                    paragraph_group=merged_src,
+                    inline_blocks=list(plan.protected_tokens_map.keys()) if plan.protected_tokens_map else None,
+                    manual_translation=mt_text,
+                    llm1_translation=llm1_text,
+                    llm2_translation=llm2_text,
+                    glossary_term=gloss_hit,
+                    final_text=plan.final_rendered_text
+                )
+
         _print_translation_samples(orig_containers, plans, diagnostics, verbose=verbose)
 
         # Stage 5: Kind-aware Typesetting (Step 8)
@@ -1591,6 +1532,18 @@ def translate_pdf_bytes_pipeline(
             total_time=total_time,
             diagnostics=diagnostics,
             errors=errors,
+        )
+
+        logger.log_general_insights(
+            f"SUMMARY:\n"
+            f"  - Total chunks processed: {len(orig_containers)}\n"
+            f"  - Extraction time: {extraction_time:.2f}s\n"
+            f"  - Translation time: {translation_time:.2f}s\n"
+            f"  - Rendering time: {apply_time:.2f}s\n"
+            f"  - Total end-to-end time: {total_time:.2f}s\n"
+            f"  - Pipeline errors: {errors}\n"
+            f"  - Source Language: {source_lang}\n"
+            f"  - Target Language: {target_lang}\n"
         )
         return out_bytes
 

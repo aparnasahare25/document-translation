@@ -210,29 +210,32 @@ def _llm1_refine(
     is_placeholder: bool = False,
     is_short_mode: bool = False,
     kind: Optional[str] = None,
-    paragraph_context: Optional[List[str]] = None,  # sibling lines in same paragraph
+    paragraph_context: Optional[List[str]] = None, # sibling lines in same paragraph
 ) -> str:
     system_lines = [
-        f"You are a professional technical translator and editor ({source_lang.upper()} -> {target_lang.upper()}).",
-        "Task: Improve the provided machine translation so it is grammatically correct, fluent, and faithful.",
-        "Rules:",
-        " - Preserve meaning exactly.",
-        " - Preserve numbers, units, codes, part numbers, and tokens like [[...]] exactly.",
-        " - Do not add extra commentary or chat.",
+        f"You are a PROFESSIONAL TECHNICAL TRANSLATOR AND EDITOR for ({source_lang.upper()} -> {target_lang.upper()}).",
+        "Task: IMPROVE the provided machine translation so it is GRAMMATICALLY CORRECT, FLUENT, and FAITHFUL.",
+        "STRICT RULES TO FOLLOW:",
+        " - ALWAYS PRESERVE the meaning of the original text EXACTLY.",
+        " - ALWAYS PRESERVE numbers, units, codes, part numbers, and tokens like '[[INLINE#]]' and '[[BLOCK#]]' EXACTLY.",
+        " - ALWAYS PRESERVE tokens like '[L#]' and '[/L#]' which indicate line breaks in the original PDF. Do not add or remove them, and keep them in the same position relative to the text."
+        " - NEVER add extra commentary or chat.",
     ]
     
     # Kind-aware specific instructions (Step 8.3/7.3)
     if kind == "TABLE_CELL":
+        print(f"Applying TABLE_CELL instructions for source: '{_preview(source_text)}'")
         system_lines.append(" - CONTEXT: This is a table cell. Keep it professional and avoid leading/trailing punctuation if not present in source.")
     elif kind == "HEADER_FOOTER":
+        print(f"Applying HEADER_FOOTER instructions for source: '{_preview(source_text)}'")
         system_lines.append(" - CONTEXT: This is a header or footer. Keep it brief and formal.")
     elif kind == "LABEL":
+        print(f"Applying LABEL instructions for source: '{_preview(source_text)}'")
         system_lines.append(" - CONTEXT: This is a short label inside a diagram or UI. Conciseness is CRITICAL.")
-
     if is_short_mode:
+        print(f"Applying SHORT MODE instructions for source: '{_preview(source_text)}'")
         system_lines.append(" - SHORT MODE ACTIVE: Perform a 'lossy' grammar compression: remove articles (the, a, is), use abbreviations, and provide the shortest valid translation variant that fits in tight space.")
-    
-    system_lines.append("Output JSON with key: translation")
+    system_lines.append("STRICTLY ALWAYS PROVIDE OUTPUT JSON with key: translation")
     
     system = "\n".join(system_lines)
 
@@ -252,7 +255,8 @@ def _llm1_refine(
     # Gives the LLM full-sentence context for grammar quality even though each line
     # is translated and placed individually.
     if paragraph_context:
-        payload["paragraph_context"] = paragraph_context
+        pass
+        # payload["paragraph_context"] = paragraph_context
 
     cand = mt_text
     # 7.2: Auto-repair/re-run with stricter constraints
@@ -267,6 +271,7 @@ def _llm1_refine(
                 continue
                 
             if is_placeholder and not _preserves_placeholders(curr_cand, source_text):
+                print(f"LLM1 ouput failed to preserve placeholders on attempt {attempt+1}/{max_retries}.")
                 # 7.2 Stricter constraint retry
                 payload["instructions"] = "FATAL ERROR: You dropped or corrupted mandatory [[...]] placeholders. YOU MUST PRESERVE THEM EXACTLY. Re-try now."
                 payload["temperature"] = 0.0 # Force determinism on retry
@@ -490,6 +495,9 @@ def translate_blocks(
     llm1_debug_by_index: Dict[int, Dict[str, str]] = {}
     llm1_debug_lock = threading.Lock()
 
+    llm2_debug_by_index: Dict[int, Dict[str, str]] = {}
+    llm2_debug_lock = threading.Lock()
+
     def llm1_task(i: int) -> Tuple[int, str, float]:
         t0 = time.perf_counter()
         if skip_mask[i]:
@@ -540,6 +548,7 @@ def translate_blocks(
                     refined = mt
                 else:
                     refined = src
+            print(f"LLM1 refined index {i}: '{_preview(src)}' -> '{_preview(refined)}'")
             return i, refined, (time.perf_counter() - t0)
         except Exception as e:
             with stats_lock:
@@ -598,16 +607,16 @@ def translate_blocks(
     # -------------------------
     final_out: List[str] = list(pass1)
 
-    def llm2_task(i: int) -> Tuple[int, str, float]:
+    def llm2_task(i: int) -> Tuple[int, str, float, str]:
         t0 = time.perf_counter()
         if skip_mask[i]:
-            return i, src_texts[i], (time.perf_counter() - t0)
+            return i, src_texts[i], (time.perf_counter() - t0), ""
 
         src = src_texts[i].strip()
         cur = pass1[i].strip()
 
         if not src or _should_skip_translation(src):
-            return i, src_texts[i], (time.perf_counter() - t0)
+            return i, src_texts[i], (time.perf_counter() - t0), ""
 
         is_placeholder = ("[[BLOCK" in src) or ("[[INLINE" in src) or bool(_extract_placeholders(src))
         
@@ -616,7 +625,7 @@ def translate_blocks(
 
         # OPTIONAL: can use prev 10 pass1 chunks as extra context inside your refine function
         try:
-            refined = refine_segment_with_glossary(
+            res = refine_segment_with_glossary(
                 english_chunk=src,
                 current_translation=cur,
                 is_placeholder=is_placeholder,
@@ -625,16 +634,20 @@ def translate_blocks(
                 source_lang=source_lang,
                 target_lang=target_lang,
                 is_short_mode=is_short_mode,
+                return_full_info=True,
             )
+            refined = res["final_translation"]
+            top_hit = res["top_glossary_hit"]
+
             if is_placeholder and not _preserves_placeholders(refined, src):
                 refined = cur
-            return i, refined if refined else cur, (time.perf_counter() - t0)
+            return i, refined if refined else cur, (time.perf_counter() - t0), top_hit
         except Exception as e:
             with stats_lock:
                 counts["llm2_failures"] += 1
                 counts["errors"] += 1
             _safe_print(f"[LLM2] failed at i={i}: {e} -> keep LLM1", verbose=eff_verbose)
-            return i, cur, (time.perf_counter() - t0)
+            return i, cur, (time.perf_counter() - t0), ""
 
     llm2_indices = [i for i in range(n) if not skip_mask[i] and pass1[i] != src_texts[i]]
     counts["llm2_candidates"] = len(llm2_indices)
@@ -651,12 +664,19 @@ def translate_blocks(
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(llm2_task, i) for i in llm2_indices]
             for done_idx, fut in enumerate(as_completed(futs), start=1):
-                i, out_t, elapsed = fut.result()
+                i, out_t, elapsed, top_hit = fut.result()
                 final_out[i] = out_t
 
                 with stats_lock:
                     timings["llm2_total"] += elapsed
                     per_chunk_total[i] += elapsed
+
+                with llm2_debug_lock:
+                    llm2_debug_by_index[i] = {
+                        "original": src_texts[i],
+                        "translated": out_t,
+                        "glossary_hit": top_hit
+                    }
 
                 if eff_verbose and (done_idx % log_every_n == 0):
                     _safe_print(
@@ -691,6 +711,17 @@ def translate_blocks(
             "original": row.get("original", ""),
             "translated": row.get("translated", ""),
             "mt": row.get("mt", ""),
+        })
+
+    # deterministic LLM2 sample list
+    llm2_pairs: List[Dict[str, Any]] = []
+    for i in sorted(llm2_debug_by_index.keys()):
+        row = llm2_debug_by_index[i]
+        llm2_pairs.append({
+            "index": i,
+            "original": row.get("original", ""),
+            "translated": row.get("translated", ""),
+            "glossary_hit": row.get("glossary_hit", ""),
         })
 
     diagnostics: Dict[str, Any] = {
@@ -730,8 +761,10 @@ def translate_blocks(
         },
         # samples for pdf pipeline log printer
         "llm1_pairs": llm1_pairs,
+        "llm2_pairs": llm2_pairs,
         "samples": {
             "llm1_pairs": llm1_pairs,
+            "llm2_pairs": llm2_pairs,
         },
     }
 

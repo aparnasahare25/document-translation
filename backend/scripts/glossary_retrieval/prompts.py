@@ -28,7 +28,7 @@ YOU MUST:
 - **STRICTLY NEVER CHANGE** numbers, ranges, torque values, units, part numbers, error codes, abbreviations, IDs, or technical references unless correcting a 100% CLEAR mistake.
 - **ALWAYS MAINTAIN** a professional, neutral, technical tone.{extra_rules}
 - **KEEP THE FOLLOWING PLACEHOLDERS EXACTLY AS THEY ARE - STRICTLY NEVER CHANGE OR SHIFT THESE**:
-    - `[[INLINE0]]`, `[[BLOCK0]]`, `[[BLOCK1]]`
+    - `[[INLINE0]]`, `[[BLOCK0]]`, `[[BLOCK1]]`, [L1], [/L1], [L2], [/L2], etc.
 
 ## **OUTPUT REQUIREMENT**
 

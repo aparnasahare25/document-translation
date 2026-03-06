@@ -27,7 +27,13 @@ async def translate_pdf(
         raise HTTPException(status_code=400, detail="Empty file.")
 
     try:
-        out_bytes = translate_pdf_bytes_pipeline(pdf_bytes, source_lang=source_lang, target_lang=target_lang, verbose=VERBOSE_FLAG)
+        out_bytes = translate_pdf_bytes_pipeline(
+            pdf_bytes, 
+            source_lang=source_lang, 
+            target_lang=target_lang, 
+            verbose=VERBOSE_FLAG,
+            filename=file.filename
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
