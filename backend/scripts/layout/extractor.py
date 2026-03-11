@@ -1,5 +1,4 @@
-import fitz
-import re
+import fitz, re
 from typing import List, Dict, Tuple, Any, Optional
 
 from scripts.layout.containers import ContainerRef, ContainerKind, PdfSpanAttrs
@@ -23,10 +22,10 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
 
     KEY DESIGN:
         - Each container gets the EXACT bbox of its original DocInt line/word cluster.
-          This ensures translated text is placed back at precisely the right position.
+        This ensures translated text is placed back at precisely the right position.
         - Lines that belong to the same paragraph group share a `paragraph_group_id`
-          (e.g. "p2_3" = page 2, group 3). The translation stage uses this to build
-          a LLM context window for grammar quality, without merging bboxes.
+        (e.g. "p2_3" = page 2, group 3). The translation stage uses this to build
+        a LLM context window for grammar quality, without merging bboxes.
     """
     containers: List[ContainerRef] = []
 
@@ -34,16 +33,14 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
         return containers
 
     # -------------------------
-    # 1. Page scale factors (DocInt units -> fitz points)
+    # 1. page scale factors (DocInt units -> fitz points)
     # -------------------------
     page_scale: Dict[int, Tuple[float, float]] = {}
     for page_obj in analyze_result.pages:
         pno = getattr(page_obj, "page_number", None) or getattr(page_obj, "pageNumber", None)
-        if not pno:
-            continue
+        if not pno: continue
         page_index = int(pno) - 1
-        if page_index < 0 or page_index >= doc.page_count:
-            continue
+        if page_index < 0 or page_index >= doc.page_count: continue
 
         fitz_page = doc[page_index]
         fw, fh = float(fitz_page.rect.width), float(fitz_page.rect.height)
@@ -54,7 +51,7 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
         page_scale[page_index] = (sx, sy)
 
     # -------------------------
-    # 2. Table Cells (each cell = one container, no paragraph_group_id needed)
+    # 2. table cells (each cell = one container, no paragraph_group_id needed)
     # -------------------------
     table_bboxes: Dict[int, List[Tuple[float, float, float, float]]] = {}
 
@@ -72,27 +69,22 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
 
             for br in brs:
                 pno = getattr(br, "page_number", None) or getattr(br, "pageNumber", None)
-                if not pno:
-                    continue
+                if not pno: continue
                 pi = int(pno) - 1
-                if pi < 0 or pi >= doc.page_count:
-                    continue
+                if pi < 0 or pi >= doc.page_count: continue
                 poly = getattr(br, "polygon", None)
                 bb = _poly_to_bbox(poly)
-                if not bb:
-                    continue
+                if not bb: continue
                 sx, sy = page_scale.get(pi, (72.0, 72.0))
                 cell_box_list.append(_scale_bbox(bb, sx, sy))
                 cell_page_index = pi
 
-            if cell_page_index is None or not cell_box_list:
-                continue
+            if cell_page_index is None or not cell_box_list: continue
 
             bbox = _union_bbox(cell_box_list)
-            if _bbox_area(bbox) < 2.0:
-                continue
+            if _bbox_area(bbox) < 2.0: continue
 
-            # Track table geometry per page so body line extraction can skip overlap
+            # track table geometry per page so body line extraction can skip overlap
             table_bboxes.setdefault(cell_page_index, []).append(bbox)
 
             style_hints = {
@@ -106,21 +98,19 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
                 text=text,
                 kind=ContainerKind.TABLE_CELL,
                 style_hints=style_hints,
-                paragraph_group_id=None,  # table cells are self-contained
+                paragraph_group_id=None, # table cells are self-contained
             ))
 
     # -------------------------
-    # 3. Body lines: one ContainerRef per line, grouped for context
+    # 3. body lines: one ContainerRef per line, grouped for context
     # -------------------------
-    global_group_counter = 0  # incremented for every new paragraph group across all pages
+    global_group_counter = 0 # incremented for every new paragraph group across all pages
 
     for page_obj in analyze_result.pages:
         pno = getattr(page_obj, "page_number", None) or getattr(page_obj, "pageNumber", None)
-        if not pno:
-            continue
+        if not pno: continue
         page_index = int(pno) - 1
-        if page_index < 0 or page_index >= doc.page_count:
-            continue
+        if page_index < 0 or page_index >= doc.page_count: continue
 
         sx, sy = page_scale.get(page_index, (72.0, 72.0))
         page_height = float(doc[page_index].rect.height)
@@ -129,28 +119,24 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
 
         lines = getattr(page_obj, "lines", None) or []
 
-        # Pre-process lines: scale, skip table overlaps, record bbox+poly
+        # pre-process lines: scale, skip table overlaps, record bbox+poly
         page_lines = []
         for ln in lines:
             txt = (getattr(ln, "content", "") or "").strip()
-            if not txt:
-                continue
+            if not txt: continue
             bb = _poly_to_bbox(getattr(ln, "polygon", None))
-            if not bb:
-                continue
+            if not bb: continue
             bb = _scale_bbox(bb, sx, sy)
-            if _bbox_area(bb) < 2.0:
-                continue
+            if _bbox_area(bb) < 2.0: continue
 
-            # Skip lines that overlap table cells (>40% of line area)
+            # skip lines that overlap table cells (>40% of line area)
             l_area = _bbox_area(bb)
             overlap = False
             for tb in tb_boxes:
                 if _bbox_overlap_area(bb, tb) > 0.4 * l_area:
                     overlap = True
                     break
-            if overlap:
-                continue
+            if overlap: continue
 
             page_lines.append({
                 "text": txt,
@@ -158,18 +144,16 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
                 "poly": _scale_poly(getattr(ln, "polygon", None), sx, sy),
             })
 
-        # Separate headers/footers (top 8% or bottom 8% of page)
+        # separate headers/footers (top 8% or bottom 8% of page)
         header_footer_lines = []
         body_lines = []
         for ln in page_lines:
             bb = ln["bbox"]
             mid_y = (bb[1] + bb[3]) / 2.0
-            if mid_y < page_height * 0.08 or mid_y > page_height * 0.92:
-                header_footer_lines.append(ln)
-            else:
-                body_lines.append(ln)
+            if mid_y < page_height * 0.08 or mid_y > page_height * 0.92: header_footer_lines.append(ln)
+            else: body_lines.append(ln)
 
-        # Emit header/footer lines: each gets its own container, no paragraph group
+        # emit header/footer lines: each gets its own container, no paragraph group
         for ln in header_footer_lines:
             containers.append(ContainerRef(
                 page_index=page_index,
@@ -180,7 +164,7 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
                 paragraph_group_id=None,
             ))
 
-        # Sort body lines: top-to-bottom, left-to-right
+        # sort body lines: top-to-bottom, left-to-right
         body_lines.sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))
 
         # -------------------------------------------------------
@@ -202,9 +186,9 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
             bb, prev_bb = ln["bbox"], prev["bbox"]
             lh = bb[3] - bb[1]
             prev_lh = prev_bb[3] - prev_bb[1]
-            y_diff = bb[1] - prev_bb[3]                            # gap between lines
-            x_diff = abs(bb[0] - prev_bb[0])                      # left-edge distance
-            x_overlap = min(bb[2], prev_bb[2]) - max(bb[0], prev_bb[0])  # horizontal overlap
+            y_diff = bb[1] - prev_bb[3]                                     # gap between lines
+            x_diff = abs(bb[0] - prev_bb[0])                                # left-edge distance
+            x_overlap = min(bb[2], prev_bb[2]) - max(bb[0], prev_bb[0])     # horizontal overlap
 
             if y_diff < max(lh, prev_lh) * 1.5 and (x_overlap > 0 or x_diff < 15):
                 current_group.append(ln)
@@ -215,16 +199,14 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
         if current_group:
             groups.append(current_group)
 
-        # Column detection for reading order (3 vertical bands)
+        # column detection for reading order (3 vertical bands)
         def get_col_band(x0: float, pw: float) -> int:
-            if x0 < pw * 0.35:
-                return 0
-            if x0 < pw * 0.65:
-                return 1
+            if x0 < pw * 0.35: return 0
+            if x0 < pw * 0.65: return 1
             return 2
 
-        # Flatten groups back to individual lines while assigning group IDs
-        # Sort groups by column band then top y for a sane reading order
+        # flatten groups back to individual lines while assigning group IDs
+        # sort groups by column band then top y for a sane reading order
         groups.sort(key=lambda g: (
             get_col_band(g[0]["bbox"][0], page_width),
             g[0]["bbox"][1],
@@ -235,21 +217,17 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
             global_group_counter += 1
             group_id = f"p{page_index}_{global_group_counter}"
 
-            # Determine group-level kind for kind-propagation to each line
+            # determine group-level kind for kind-propagation to each line
             group_text = " ".join(ln["text"] for ln in g)
             group_bbox = _union_bbox([ln["bbox"] for ln in g])
 
-            if len(g) == 1 and len(group_text) < 20 and _bbox_area(group_bbox) < (page_width * page_height * 0.05):
-                group_kind = ContainerKind.LABEL
-            elif _is_bullet(group_text):
-                group_kind = ContainerKind.LIST_ITEM
-            else:
-                group_kind = ContainerKind.PARAGRAPH
+            if len(g) == 1 and len(group_text) < 20 and _bbox_area(group_bbox) < (page_width * page_height * 0.05): group_kind = ContainerKind.LABEL
+            elif _is_bullet(group_text): group_kind = ContainerKind.LIST_ITEM
+            else: group_kind = ContainerKind.PARAGRAPH
 
             for ln in g:
-                # 10) Layout Preservation - Line bboxes
-                # Expand slightly (padding) horizontally to avoid wrapping or 
-                # unnecessary font shrinkage from tight precision gaps.
+                # 10) layout preservation - Line bboxes
+                # expand slightly (padding) horizontally to avoid wrapping or unnecessary font shrinkage from tight precision gaps
                 bb = list(ln["bbox"])
                 bb[0] = max(0, bb[0] - 1.0) # -1pt left
                 bb[2] = min(page_width, bb[2] + 1.0) # +1pt right
@@ -267,7 +245,7 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
                 reading_key += 1
 
     # -------------------------
-    # 4. Final global sort: page → header/footer first → reading order
+    # 4. final global sort: page -> header/footer first -> reading order
     # -------------------------
     containers.sort(key=lambda c: (
         c.page_index,
@@ -278,16 +256,15 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
     ))
 
     # -------------------------
-    # 5. Span mapping (9.2: for precise text removal)
+    # 5. span mapping (for precise text removal)
     # -------------------------
     map_spans_to_containers(doc, containers, verbose=verbose)
-
     return containers
 
 
 def map_spans_to_containers(doc: fitz.Document, containers: List[ContainerRef], verbose: bool = False):
     """
-    9.2 Span-targeted removal.
+    Span-targeted removal.
     Maps actual PDF text spans from PyMuPDF back to DocInt containers.
     Because containers now have tight per-line bboxes, span hits are more accurate.
     """
@@ -308,9 +285,9 @@ def map_spans_to_containers(doc: fitz.Document, containers: List[ContainerRef], 
                     if s_area < 0.1:
                         continue
 
-                    # Assign span to the container with the most overlap
+                    # assign span to the container with the most overlap
                     best_c = None
-                    best_overlap = 0.3 * s_area  # Lowered from 0.5 to be more robust
+                    best_overlap = 0.3 * s_area # Lowered from 0.5 to be more robust
                     for c in page_containers:
                         overlap = _bbox_overlap_area(s_bbox, c.bbox)
                         if overlap > best_overlap:

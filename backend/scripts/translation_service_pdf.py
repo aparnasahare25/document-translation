@@ -31,7 +31,7 @@ VERBOSE = os.getenv("PDF_TRANSLATION_VERBOSE", "1").strip().lower() in ("1", "tr
 
 
 # -----------------------------
-# Small helpers
+# small helpers
 # -----------------------------
 _PLACEHOLDER_RE = re.compile(r"\[\[[^\]]+\]\]")
 
@@ -46,8 +46,10 @@ def _norm_lang(lang: str) -> str:
     t = mapping.get(t, t)
     return t.split("-", 1)[0] if t else t
 
+
 def _has_alpha(s: str) -> bool:
     return any(ch.isalpha() for ch in s)
+
 
 def _should_skip_translation(text: str) -> bool:
     t = (text or "").strip()
@@ -61,8 +63,10 @@ def _should_skip_translation(text: str) -> bool:
         return True
     return False
 
+
 def _extract_placeholders(s: str) -> List[str]:
     return _PLACEHOLDER_RE.findall(s or "")
+
 
 def _preserves_placeholders(out: str, src: str) -> bool:
     src_ph = _extract_placeholders(src)
@@ -71,9 +75,11 @@ def _preserves_placeholders(out: str, src: str) -> bool:
     out_s = out or ""
     return all(p in out_s for p in src_ph)
 
+
 def _safe_print(msg: str, *, verbose: Optional[bool] = None) -> None:
     if VERBOSE if verbose is None else bool(verbose):
         print(msg)
+
 
 def _preview(s: str, limit: int = 180) -> str:
     t = (s or "").replace("\n", "\\n")
@@ -81,7 +87,7 @@ def _preview(s: str, limit: int = 180) -> str:
 
 
 # -----------------------------
-# Thread-local HTTP sessions (thread-safe/faster)
+# thread-local HTTP sessions (thread-safe/faster)
 # -----------------------------
 _tls = threading.local()
 
@@ -99,30 +105,19 @@ def _session() -> requests.Session:
 class AzureTranslator:
     def __init__(self) -> None:
         if not AZURE_TRANSLATOR_KEY or not AZURE_TRANSLATOR_ENDPOINT:
-            raise RuntimeError(
-                "Missing Azure Translator credentials. "
-                "Set AZURE_TRANSLATOR_KEY and AZURE_TRANSLATOR_ENDPOINT."
-            )
+            raise RuntimeError("Missing Azure Translator credentials. "
+                            "Set AZURE_TRANSLATOR_KEY and AZURE_TRANSLATOR_ENDPOINT.")
 
     def translate_batch(self, texts: List[str], source_lang: str, target_lang: str) -> List[str]:
-        if not texts:
-            return []
+        if not texts: return []
         src = _norm_lang(source_lang)
         tgt = _norm_lang(target_lang)
 
         endpoint = AZURE_TRANSLATOR_ENDPOINT.rstrip("/")
         url = f"{endpoint}/translate"
-        params = {
-            "api-version": AZURE_TRANSLATOR_API_VERSION or "3.0",
-            "from": src,
-            "to": tgt,
-        }
-        headers = {
-            "Ocp-Apim-Subscription-Key": AZURE_TRANSLATOR_KEY,
-            "Content-Type": "application/json",
-        }
-        if AZURE_TRANSLATOR_REGION:
-            headers["Ocp-Apim-Subscription-Region"] = AZURE_TRANSLATOR_REGION
+        params = {"api-version": AZURE_TRANSLATOR_API_VERSION or "3.0", "from": src, "to": tgt}
+        headers = {"Ocp-Apim-Subscription-Key": AZURE_TRANSLATOR_KEY, "Content-Type": "application/json"}
+        if AZURE_TRANSLATOR_REGION: headers["Ocp-Apim-Subscription-Region"] = AZURE_TRANSLATOR_REGION
 
         body = [{"text": t} for t in texts]
 
@@ -131,16 +126,13 @@ class AzureTranslator:
         for attempt in range(4):
             try:
                 resp = _session().post(url, params=params, headers=headers, data=json.dumps(body), timeout=60)
-                if resp.status_code >= 400:
-                    raise RuntimeError(f"Translator HTTP {resp.status_code}: {resp.text[:400]}")
+                if resp.status_code >= 400: raise RuntimeError(f"Translator HTTP {resp.status_code}: {resp.text[:400]}")
                 data = resp.json()
                 out: List[str] = []
                 # response aligns with input order
                 for i, item in enumerate(data):
-                    try:
-                        out.append(item["translations"][0]["text"])
-                    except Exception:
-                        out.append(texts[i])
+                    try: out.append(item["translations"][0]["text"])
+                    except Exception: out.append(texts[i])
                 return out
             except Exception as e:
                 last_err = e
@@ -166,30 +158,19 @@ class AzureOpenAIChat:
         dep = AZURE_OPENAI_DEPLOYMENT_NAME
         url = f"{endpoint}/openai/deployments/{dep}/chat/completions"
         params = {"api-version": AZURE_OPENAI_API_VERSION}
-        headers = {
-            "api-key": AZURE_OPENAI_API_KEY,
-            "Content-Type": "application/json",
-        }
-        body = {
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-            "response_format": {"type": "json_object"},
-        }
+        headers = {"api-key": AZURE_OPENAI_API_KEY, "Content-Type": "application/json"}
+        body = {"temperature": temperature, "max_tokens": max_tokens,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},],
+            "response_format": {"type": "json_object"}}
 
         last_err: Optional[Exception] = None
         for attempt in range(4):
             try:
                 resp = _session().post(url, params=params, headers=headers, data=json.dumps(body), timeout=90)
-                if resp.status_code >= 400:
-                    raise RuntimeError(f"AOAI HTTP {resp.status_code}: {resp.text[:400]}")
+                if resp.status_code >= 400: raise RuntimeError(f"AOAI HTTP {resp.status_code}: {resp.text[:400]}")
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
-                try:
-                    return json.loads(content)
+                try: return json.loads(content)
                 except Exception:
                     # sometimes model returns JSON-ish text; try to salvage
                     return {"translation": content.strip()}
@@ -224,7 +205,7 @@ def _llm1_refine(
         " - NEVER add extra commentary or chat.",
     ]
     
-    # Kind-aware specific instructions (Step 8.3/7.3)
+    # kind-aware specific instructions
     if kind == "TABLE_CELL":
         print(f"Applying TABLE_CELL instructions for source: '{_preview(source_text)}'")
         system_lines.append(" - CONTEXT: This is a table cell. Keep it professional and avoid leading/trailing punctuation if not present in source.")
@@ -250,18 +231,16 @@ def _llm1_refine(
         "instructions": "Return only JSON.",
     }
 
-    if kind:
-        payload["container_kind"] = kind
+    if kind: payload["container_kind"] = kind
 
-    # Paragraph context: sibling lines that belong to the same paragraph group.
-    # Gives the LLM full-sentence context for grammar quality even though each line
-    # is translated and placed individually.
+    # paragraph context: sibling lines that belong to the same paragraph group.
+    # gives the LLM full-sentence context for grammar quality even though each line is translated and placed individually.
     if paragraph_context:
         pass
         # payload["paragraph_context"] = paragraph_context
 
     cand = mt_text
-    # 7.2: Auto-repair/re-run with stricter constraints
+    # auto-repair/re-run with stricter constraints
     max_retries = 3 if is_placeholder else 2
     
     for attempt in range(max_retries):
@@ -269,28 +248,26 @@ def _llm1_refine(
             out = aoai.chat_json(system, payload, temperature=0.1, max_tokens=900)
             curr_cand = (out.get("translation") or "").strip()
             
-            if not curr_cand:
-                continue
+            if not curr_cand: continue
                 
             if is_placeholder and not _preserves_placeholders(curr_cand, source_text):
                 print(f"LLM1 ouput failed to preserve placeholders on attempt {attempt+1}/{max_retries}.")
-                # 7.2 Stricter constraint retry
+                # stricter constraint retry
                 payload["instructions"] = "FATAL ERROR: You dropped or corrupted mandatory [[...]] placeholders. YOU MUST PRESERVE THEM EXACTLY. Re-try now."
-                payload["temperature"] = 0.0 # Force determinism on retry
+                payload["temperature"] = 0.0 # force determinism on retry
                 continue
             
             cand = curr_cand
             break
         except Exception:
-            if attempt == max_retries - 1:
-                break
+            if attempt == max_retries - 1: break
             time.sleep(0.5)
 
     return cand if cand else mt_text
 
 
 # -----------------------------
-# Public API: translate_blocks
+# public API: translate_blocks
 # -----------------------------
 def translate_blocks(
     blocks: List[ContainerRef],
@@ -321,16 +298,12 @@ def translate_blocks(
     """
     t_pipeline_start = time.perf_counter()
 
-    if source_lang is None:
-        source_lang = SOURCE_LANG_DEFAULT
-    if target_lang is None:
-        target_lang = TARGET_LANG_DEFAULT
-    if max_workers is None:
-        max_workers = max(1, PDF_TRANSLATION_MAX_WORKERS)
+    if source_lang is None: source_lang = SOURCE_LANG_DEFAULT
+    if target_lang is None: target_lang = TARGET_LANG_DEFAULT
+    if max_workers is None: max_workers = max(1, PDF_TRANSLATION_MAX_WORKERS)
 
     eff_verbose = VERBOSE if verbose is None else bool(verbose)
-    if debug is not None:
-        eff_verbose = bool(debug)
+    if debug is not None: eff_verbose = bool(debug)
 
     want_diagnostics = bool(return_diagnostics or with_diagnostics)
     log_every_n = max(1, int(log_every_n or 5))
@@ -352,12 +325,9 @@ def translate_blocks(
     }
     for t in src_texts:
         s = (t or "").strip()
-        if not s:
-            skip_reasons["empty_or_whitespace"] += 1
-        elif not _has_alpha(s):
-            skip_reasons["no_alpha"] += 1
-        elif re.fullmatch(r"(https?://\S+|www\.\S+)", s, flags=re.IGNORECASE):
-            skip_reasons["url_or_www_only"] += 1
+        if not s: skip_reasons["empty_or_whitespace"] += 1
+        elif not _has_alpha(s): skip_reasons["no_alpha"] += 1
+        elif re.fullmatch(r"(https?://\S+|www\.\S+)", s, flags=re.IGNORECASE): skip_reasons["url_or_www_only"] += 1
         else:
             # not skipped by heuristic
             pass
@@ -372,13 +342,13 @@ def translate_blocks(
     translator = AzureTranslator()
     aoai = AzureOpenAIChat()
 
-    # Diagnostics / timing
+    # diagnostics / timing
     stats_lock = threading.Lock()
     timings: Dict[str, float] = {
-        "azure_mt_total": 0.0, # wall time sum of MT batches
-        "llm1_total": 0.0, # sum of per-call LLM1 elapsed
-        "llm2_total": 0.0, # sum of per-call LLM2 elapsed
-        "end_to_end_sum": 0.0, # sum of per-chunk approx latencies across stages
+        "azure_mt_total": 0.0,  # wall time sum of MT batches
+        "llm1_total": 0.0,      # sum of per-call LLM1 elapsed
+        "llm2_total": 0.0,      # sum of per-call LLM2 elapsed
+        "end_to_end_sum": 0.0,  # sum of per-chunk approx latencies across stages
         "stage_mt_wall": 0.0,
         "stage_llm1_wall": 0.0,
         "stage_llm2_wall": 0.0,
@@ -403,7 +373,7 @@ def translate_blocks(
     per_chunk_total: List[float] = [0.0] * n
 
     # -------------------------
-    # Stage 1: MT (batched + threaded)
+    # stage 1: MT (batched + threaded)
     # -------------------------
     mt_out: List[str] = list(src_texts)
 
@@ -481,12 +451,12 @@ def translate_blocks(
     )
 
     # -------------------------
-    # Stage 2: LLM1 (parallel; context is previous 10 src+mt + paragraph group)
+    # stage 2: LLM1 (parallel; context is previous 10 src+mt + paragraph group)
     # -------------------------
     pass1: List[str] = list(mt_out)
 
-    # Build paragraph group map: group_id -> list of (index, source_text)
-    # Used to construct paragraph_context for LLM1 without merging bboxes.
+    # build paragraph group map: group_id -> list of (index, source_text)
+    # used to construct paragraph_context for LLM1 without merging bboxes.
     group_map: Dict[str, List[int]] = {}
     for i, b in enumerate(blocks):
         gid = getattr(b, "paragraph_group_id", None)
@@ -505,7 +475,7 @@ def translate_blocks(
         if skip_mask[i]:
             return i, src_texts[i], (time.perf_counter() - t0)
 
-        # Rolling 10-chunk context (cross-paragraph continuity)
+        # rolling 10-chunk context (cross-paragraph continuity)
         ctx: List[Dict[str, str]] = []
         start = max(0, i - 10)
         for j in range(start, i):
@@ -516,8 +486,8 @@ def translate_blocks(
         if not src or _should_skip_translation(src):
             return i, src_texts[i], (time.perf_counter() - t0)
 
-        # Paragraph context: sibling source lines in the same group (for grammar coherence).
-        # Excludes the current line itself; preserves reading order.
+        # paragraph context: sibling source lines in the same group (for grammar coherence).
+        # excludes the current line itself; preserves reading order.
         para_ctx: Optional[List[str]] = None
         gid = getattr(blocks[i], "paragraph_group_id", None)
         if gid and gid in group_map:
@@ -605,7 +575,7 @@ def translate_blocks(
     )
 
     # -------------------------
-    # Stage 3: LLM2 (RAG refine; parallel; language-only)
+    # stage 3: LLM2 (RAG refine; parallel; language-only)
     # -------------------------
     final_out: List[str] = list(pass1)
 
@@ -698,7 +668,7 @@ def translate_blocks(
     timings["translate_blocks_wall"] = time.perf_counter() - t_pipeline_start
 
     # -------------------------
-    # Return ContainerTranslation list in original order
+    # return ContainerTranslation list in original order
     # -------------------------
     out: List[ContainerTranslation] = []
     for i, b in enumerate(blocks):

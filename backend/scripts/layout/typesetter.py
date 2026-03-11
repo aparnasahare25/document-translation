@@ -19,7 +19,7 @@ def _looks_rtl(text: str) -> bool:
             '\u0750' <= ch <= '\u077F' or  # Arabic Supplement
             '\u08A0' <= ch <= '\u08FF' or  # Arabic Extended-A
             '\uFB50' <= ch <= '\uFDFF' or  # Arabic Presentation Forms-A
-            '\uFE70' <= ch <= '\uFEFF'):    # Arabic Presentation Forms-B
+            '\uFE70' <= ch <= '\uFEFF'):   # Arabic Presentation Forms-B
             return True
     return False
 
@@ -44,7 +44,7 @@ def _wrap_text_to_width(text: str, font: fitz.Font, fontsize: float, max_width: 
     if not text:
         return []
 
-    # 8.2 RTL scripts: directionality hook
+    # RTL scripts: directionality hook
     if _looks_rtl(text):
         text = _bidirectional_shape(text)
         
@@ -54,11 +54,11 @@ def _wrap_text_to_width(text: str, font: fitz.Font, fontsize: float, max_width: 
             continue
             
         if cjk_mode:
-            # 8.2 CJK: character-based wrapping with ASCII-run preservation
+            # CJK: character-based wrapping with ASCII-run preservation
             cur = ""
             ascii_buf = ""
             for ch in para:
-                # Basic ASCII run preservation (A-Z, a-z, 0-9)
+                # basic ASCII run preservation (A-Z, a-z, 0-9)
                 if ch.isalnum() and ord(ch) < 128:
                     ascii_buf += ch
                     continue
@@ -73,27 +73,24 @@ def _wrap_text_to_width(text: str, font: fitz.Font, fontsize: float, max_width: 
                         ascii_buf = ""
                     
                     if not ch.strip() and not cur: 
-                        continue # Skip leading spaces in CJK wrap
+                        continue # skip leading spaces in CJK wrap
 
                     cand = cur + ch
-                    if not cur or w(cand) <= max_width:
-                        cur = cand
+                    if not cur or w(cand) <= max_width: cur = cand
                     else:
                         lines.append(cur.rstrip())
                         cur = ch
                         
             if ascii_buf:
                 cand = cur + ascii_buf
-                if not cur or w(cand) <= max_width:
-                    cur = cand
+                if not cur or w(cand) <= max_width: cur = cand
                 else:
                     lines.append(cur.rstrip())
                     cur = ascii_buf
                     
-            if cur:
-                lines.append(cur.rstrip())
+            if cur: lines.append(cur.rstrip())
         else:
-            # 8.2 Space-delimited: word wrapping with long-token fallback
+            # space-delimited: word wrapping with long-token fallback
             words = re.split(r"(\s+)", para)
             cur = ""
             for tok in words:
@@ -129,9 +126,7 @@ def _wrap_text_to_width(text: str, font: fitz.Font, fontsize: float, max_width: 
     return lines
 
 def _truncate_lines_to_height(lines: List[str], font: fitz.Font, fontsize: float, max_width: float, max_lines: int) -> List[str]:
-    """
-    Ensure at most max_lines. If truncated, add ellipsis to last line.
-    """
+    """Ensure at most max_lines. If truncated, add ellipsis to last line."""
     if max_lines <= 0: return []
     if len(lines) <= max_lines: return lines
     out = lines[:max_lines]
@@ -174,7 +169,7 @@ def typeset_and_insert_spans(
 
     spans = plan.container.original_spans
     if not spans:
-        return False  # caller should use textbox fallback
+        return False # caller should use textbox fallback
 
     intent = plan.rendering_intent
     fontname = intent.font_name
@@ -185,11 +180,10 @@ def typeset_and_insert_spans(
     bbox = plan.container.bbox
     available_w = max(1.0, bbox[2] - bbox[0] - 0.4)
 
-    # ── Cluster spans into visual lines by y-proximity ──
-    # Spans on the same baseline (within half the font size) belong to
-    # the same visual line.
+    # ── cluster spans into visual lines by y-proximity ──
+    # spans on the same baseline (within half the font size) belong to the same visual line.
     sorted_spans = sorted(spans, key=lambda s: (s.origin[1], s.origin[0]))
-    visual_lines: list = []  # list of lists of PdfSpanAttrs
+    visual_lines: list = [] # list of lists of PdfSpanAttrs
     cur_line: list = []
     cur_y: Optional[float] = None
 
@@ -208,16 +202,16 @@ def typeset_and_insert_spans(
 
     num_vis_lines = len(visual_lines)
 
-    # ── Split translated text into chunks, one per visual line ──
+    # ── split translated text into chunks, one per visual line ──
     if num_vis_lines == 1:
         line_texts = [text]
     else:
-        # Split by newlines first (translator might use them)
+        # split by newlines first (translator might use them)
         parts = text.split("\n")
         if len(parts) == num_vis_lines:
             line_texts = parts
         else:
-            # Proportional split by original span text length
+            # proportional split by original span text length
             orig_lengths = []
             for vl in visual_lines:
                 orig_lengths.append(sum(len(s.text) for s in vl) or 1)
@@ -234,7 +228,7 @@ def typeset_and_insert_spans(
                     line_texts.append(flat[offset:offset + chunk_len].strip())
                     offset += chunk_len
 
-    # ── Insert each visual line at its origin ──
+    # ── insert each visual line at its origin ──
     shape = page.new_shape()
     cjk_mode = _looks_cjk(text)
 
@@ -242,13 +236,13 @@ def typeset_and_insert_spans(
         if not lt:
             continue
 
-        # Use leftmost span origin as insertion point
+        # use leftmost span origin as insertion point
         first_span = min(vl_spans, key=lambda s: s.origin[0])
         origin = fitz.Point(first_span.origin[0], first_span.origin[1])
         base_fs = max(first_span.size, 4.0)
         color = _int_to_rgb(first_span.color)
 
-        # Progressive font shrinking if text is too wide
+        # progressive font shrinking if text is too wide
         fs = base_fs
         min_fs = max(3.5, base_fs * 0.45)
         text_w = float(mf.text_length(lt, fontsize=fs))
@@ -257,7 +251,7 @@ def typeset_and_insert_spans(
             fs = max(min_fs, fs - 0.5)
             text_w = float(mf.text_length(lt, fontsize=fs))
 
-        # If still too wide, truncate with ellipsis
+        # if still too wide, truncate with ellipsis
         if text_w > available_w:
             ell = "…"
             truncated = lt
@@ -265,9 +259,9 @@ def typeset_and_insert_spans(
                 truncated = truncated[:-1]
             lt = (truncated + ell) if truncated else ell
 
-        # Adjust origin Y if font size changed (keep baseline visually close)
+        # adjust origin Y if font size changed (keep baseline visually close)
         if abs(fs - base_fs) > 0.1:
-            # Shift up slightly so baseline stays roughly in the same place
+            # shift up slightly so baseline stays roughly in the same place
             origin = fitz.Point(origin.x, origin.y)
 
         shape.insert_text(
@@ -298,8 +292,8 @@ def typeset_and_insert(
     if not text:
         return False
 
-    # ── Span-based path: precise origin insertion ──
-    # Bypass exact-origin placement for table cells so they can reflow inside their full bbox.
+    # ── span-based path: precise origin insertion ──
+    # bypass exact-origin placement for table cells so they can reflow inside their full bbox.
     # ALSO bypass for singleton paragraphs/list items so they can wrap/reflow if the translation is long.
     use_spans = False
     if plan.container.original_spans:
@@ -307,7 +301,7 @@ def typeset_and_insert(
         if kind == ContainerKind.TABLE_CELL:
             use_spans = False
         elif kind in (ContainerKind.PARAGRAPH, ContainerKind.LIST_ITEM):
-            # Only use strict spans for prose if it was already multi-line in the original
+            # only use strict spans for prose if it was already multi-line in the original
             use_spans = len(plan.container.original_spans) > 1
         else:
             use_spans = True
@@ -318,7 +312,7 @@ def typeset_and_insert(
             return True
         # fall through to textbox if span path fails
 
-    # ── Textbox-based path (raster / fallback) ──
+    # ── textbox-based path (raster / fallback) ──
     intent = plan.rendering_intent
     fontname = intent.font_name
     mf = font_map.get(fontname)
@@ -329,13 +323,13 @@ def typeset_and_insert(
     cjk_mode = _looks_cjk(text)
     r_obj = fitz.Rect(rect)
     
-    # Kind-aware policy bindings
+    # kind-aware policy bindings
     kind = plan.container.kind
     
-    # Apply vertical slack for prose to avoid aggressive shrinking/truncation
+    # apply vertical slack for prose to avoid aggressive shrinking/truncation
     if kind in (ContainerKind.PARAGRAPH, ContainerKind.LIST_ITEM):
-        # Allow expansion downwards by up to 60% of original height or 30pt
-        # This gives the translation room to wrap instead of becoming tiny.
+        # allow expansion downwards by up to 60% of original height or 30pt
+        # this gives the translation room to wrap instead of becoming tiny.
         r_obj.y1 += min(30.0, r_obj.height * 0.6)
 
     max_w = max(1.0, r_obj.width - 0.2)
@@ -366,21 +360,21 @@ def typeset_and_insert(
         
         if len(raw_lines) > max_lines_possible:
             if kind == ContainerKind.HEADER_FOOTER and fs <= min_fontsize + 0.5:
-                # If header/footer can't shrink more, just break and truncate
+                # if header/footer can't shrink more, just break and truncate
                 break
                 
-            # Compute new FS aggressively based on overshoot
+            # compute new FS aggressively based on overshoot
             fs_est = rect.height / (len(raw_lines) * lineheight_factor)
             new_fs = max(min_fontsize, min(fs - 0.5, fs_est))
             
             if fs - new_fs < 0.2:
-                # We've bottomed out the ladder
+                # bottomed out the ladder
                 break
                 
             fs = new_fs
             continue
             
-        # Try fitz's native textbox using our computed constraints
+        # try fitz's native textbox using computed constraints
         wrapped = "\n".join(raw_lines).strip()
         try:
             rc = shape.insert_textbox(
@@ -401,13 +395,13 @@ def typeset_and_insert(
             
         fs -= 0.5
         
-    # Final Fallback Component: Hard Truncate
-    # If we exit the loop, we could not fit text without overflow at `min_fontsize`. We MUST truncate.
+    # final fallback - hard truncate
+    # if we exit the loop, we could not fit text without overflow at `min_fontsize`, so we MUST truncate.
     fs = min_fontsize
     raw_lines = _wrap_text_to_width(text, mf, fs, max_w, cjk_mode=cjk_mode)
     max_lines_possible = max(1, int(rect.height / (fs * lineheight_factor)))
     
-    # 8.1 Truncate fallback
+    # truncate fallback
     truncated = _truncate_lines_to_height(raw_lines, mf, fs, max_w, max_lines_possible)
     wrapped = "\n".join(truncated).strip()
     
@@ -427,7 +421,7 @@ def typeset_and_insert(
     except:
         pass
         
-    # Absolute zero-fallback (just insert at point with no bounds check)
+    # absolute zero-fallback (just insert at point with no bounds check)
     start_pt = fitz.Point(rect.x0, rect.y0 + fs)
     shape.insert_text(start_pt, "\n".join(truncated), fontname=fontname, fontsize=fs, lineheight=lineheight_factor)
     shape.commit(overlay=True)

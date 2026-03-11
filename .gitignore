@@ -3,6 +3,7 @@ data/
 extra/
 output/
 logs/
+tmp/
 
 # Environment / secrets
 .env

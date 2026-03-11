@@ -39,10 +39,10 @@ class ContainerRef:
     polygon: Optional[List[Tuple[float, float]]] = None
     reading_key: int = 0
     style_hints: Dict[str, Any] = field(default_factory=dict)
-    original_spans: List[PdfSpanAttrs] = field(default_factory=list) # 9.2: For targeted removal
+    original_spans: List[PdfSpanAttrs] = field(default_factory=list) # for targeted removal
     source_layer: str = "docint"
     # Layout grouping: lines in the same paragraph group share an ID (e.g. "p2_3").
-    # None for table cells and standalone elements. Used to form context windows in LLM1.
+    # none for table cells and standalone elements; used to form context windows in LLM1
     paragraph_group_id: Optional[str] = None
 
 @dataclass
@@ -60,7 +60,7 @@ class TranslationPolicy(str, Enum):
 class RenderingIntent:
     font_name: str = "helv"
     font_size_start: float = 11.0
-    alignment: int = 0  # 0: left, 1: center, 2: right, 3: justify (fitz default aligns)
+    alignment: int = 0 # 0: left, 1: center, 2: right, 3: justify (fitz default aligns)
     rotation: int = 0
     color: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 

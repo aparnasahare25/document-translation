@@ -39,8 +39,8 @@ def scale_poly(poly: Any, sx: float, sy: float) -> Optional[List[Tuple[float, fl
     try:
         points = []
         if isinstance(poly, list) and len(poly) > 0 and isinstance(poly[0], (int, float)):
-             for i in range(0, len(poly), 2):
-                 points.append((poly[i]*sx, poly[i+1]*sy))
+            for i in range(0, len(poly), 2):
+                points.append((poly[i]*sx, poly[i+1]*sy))
         else:
             for p in poly:
                 if isinstance(p, dict):

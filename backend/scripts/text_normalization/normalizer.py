@@ -7,18 +7,18 @@ class NormalizationState:
     original_text: str
     placeholders: Dict[str, str]
 
-# Common artifacts list (configurable)
+# common artifacts list (configurable)
 OCR_ARTIFACTS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
-# Script ranges for de-spacing (unnatural spaces between characters)
+# script ranges for de-spacing (unnatural spaces between characters)
 CJK_RANGE = r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]'
 
-# Protected tokens
+# protected tokens
 URL_EMAIL_RE = r'\b(?:https?://|www\.)\S+\b|\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
 FILE_PATH_RE = r'(?:/[a-zA-Z0-9_.-]+)+/?|[A-Z]:\\[a-zA-Z0-9_.-\\]+'
 PART_NUMBER_RE = r'\b[A-Z0-9]+-(?:[A-Z0-9]+-)*[A-Z0-9]+\b|\b[A-Z]+\d+[A-Z0-9]*\b|\b\d+[A-Z]+[A-Z0-9]*\b|\b\d{5,12}\b'
-# Common keywords/titles that should NOT be protected as acronyms (ensure they get translated)
-COMMON_WORDS = "THE|AND|FOR|NOT|BUT|ARE|YOU|CAN|HAS|HIS|HER|WAS|ALL|ANY|OUT|HOW|WHO|THIS|THAT|WITH|FROM|SKILLS|EDUCATION|EXPERIENCE|PROJECTS|SUMMARY|CONTACT|PROFILE|ABOUT|WORK|INFO|PAGE"
+# common keywords/titles that should NOT be protected as acronyms (ensure they get translated)
+COMMON_WORDS = "YES|NO|THE|AND|FOR|NOT|BUT|ARE|YOU|CAN|HAS|HIS|HER|WAS|ALL|ANY|OUT|HOW|WHO|THIS|THAT|WITH|FROM|SKILLS|EDUCATION|EXPERIENCE|PROJECTS|SUMMARY|CONTACT|PROFILE|ABOUT|WORK|INFO|PAGE"
 ACRONYM_RE = rf'\b(?!(?:{COMMON_WORDS})\b)[A-Z]{{3,7}}\b'
 MEASUREMENT_RE = r'\b\d+(?:\.\d+)?\s*(?:mm|cm|m|km|kg|g|mg|l|ml|V|A|Hz|W|kW|MPa|psi|°C|°F|%)\b'
 UI_MARKER_RE = r'[▶▸■◆●➔➞►▼▲☑☐☒]'
@@ -28,16 +28,16 @@ PROTECTED_COMBINED_RE = re.compile(
 )
 
 def normalize_whitespace(text: str) -> str:
-    # Normalize line endings
+    # normalize line endings
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    # Collapse repeated spaces
+    # collapse repeated spaces
     text = re.sub(r'[ \t]+', ' ', text)
-    # Remove weird OCR artifacts
+    # remove weird OCR artifacts
     text = OCR_ARTIFACTS_RE.sub('', text)
     return text.strip()
 
 def script_aware_despace(text: str) -> str:
-    # Remove unnatural spaces between non-Latin script characters (e.g. CJK)
+    # remove unnatural spaces between non-Latin script characters (e.g. CJK)
     pattern = f'({CJK_RANGE})[ \t]+({CJK_RANGE})'
     # run twice to catch overlapping matches
     text = re.sub(pattern, r'\1\2', text)
@@ -51,7 +51,7 @@ def extract_protected_tokens(text: str, start_counter: int = 0) -> Tuple[str, Di
     def repl(match):
         nonlocal counter
         token = match.group(0)
-        # Avoid replacing purely whitespace or empty
+        # avoid replacing purely whitespace or empty
         if not token.strip():
             return token
         ph = f"[[INLINE{counter}]]"
@@ -71,7 +71,7 @@ def apply_normalization_pipeline(text: str, start_counter: int = 0) -> Tuple[str
 
 def restore_protected_tokens(translated_text: str, state: NormalizationState) -> str:
     restored = translated_text
-    # Restore placedholders
+    # restore placedholders
     for ph, token in state.placeholders.items():
         restored = restored.replace(ph, token)
         

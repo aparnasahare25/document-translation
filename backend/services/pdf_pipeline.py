@@ -653,17 +653,17 @@ def extract_all_blocks(pdf_bytes: bytes, *, verbose: bool = False) -> Tuple[fitz
     t_di_end = time.perf_counter()
     _vprint(verbose, f"[DOCINT] analyze_result received in {t_di_end - t_di_start:.2f}s")
 
-    # 7.1 Translate containers, not lines
+    # translate containers, not lines
     blocks = build_containers(doc, analyze_result, verbose=verbose)
 
-    # Build word-level mask regions (used for glyph-accurate inpainting, step 11.3)
+    # build word-level mask regions (used for glyph-accurate inpainting)
     from scripts.layout.raster_processor import build_mask_regions_from_analyze_result
     mask_regions_by_page = build_mask_regions_from_analyze_result(
         doc, analyze_result, verbose=verbose
     )
     _vprint(verbose, f"[PIPELINE][EXTRACT] mask_regions built for {len(mask_regions_by_page)} pages")
 
-    # Metadata for the pipeline (Step 8 routing, etc.)
+    # metadata for the pipeline (routing, etc.)
     metadata = {
         "page_count": doc.page_count,
         "analyze_result": analyze_result,
@@ -887,7 +887,7 @@ def _get_measure_font(fontname: str, fontfile: Optional[str], *, verbose: bool =
                 _vprint(verbose, f"[FONT][MEASURE] Loading measure font by name for {key}")
                 f = fitz.Font(fontname=fontname) # Base14 like helv
         except Exception:
-            # Final fallback: Base14 if everything else fails
+            # final fallback: Base14 if everything else fails
             _vprint(verbose, f"[FONT][MEASURE] Fallback to 'helv' for font={fontname}")
             f = fitz.Font("helv")
             
@@ -897,14 +897,14 @@ def _get_measure_font(fontname: str, fontfile: Optional[str], *, verbose: bool =
 
 def remove_text(page: fitz.Page, rects: List[fitz.Rect], pix: fitz.Pixmap, verbose: bool = False):
     """
-    9.3 removal strategy: text-only removal avoiding background nuke.
+    Removal strategy: text-only removal avoiding background nuke.
     Adds redaction annotations filled with the sampled background color of the region.
     When apply_redactions() runs, it removes original intersecting text/graphics
     and leaves behind a solid patch of background color.
     """
     from collections import Counter
     for r in rects:
-        # Sample background color from the perimeter (+2px)
+        # sample background color from the perimeter (+2px)
         x0 = max(0, int(r.x0))
         y0 = max(0, int(r.y0))
         x1 = min(pix.width - 1, int(r.x1))
@@ -923,7 +923,7 @@ def remove_text(page: fitz.Page, rects: List[fitz.Rect], pix: fitz.Pixmap, verbo
         else:
             mc = Counter(colors).most_common(1)[0][0]
             if isinstance(mc, int):
-                bg_fill = (1.0, 1.0, 1.0)  # Handle grayscale fallback
+                bg_fill = (1.0, 1.0, 1.0)  # handle grayscale fallback
             else:
                 bg_fill = (mc[0]/255.0, mc[1]/255.0, mc[2]/255.0)
                 
@@ -939,7 +939,7 @@ def _int_to_rgb(color_int: int) -> Tuple[float, float, float]:
 
 def _derive_rotation(poly: Optional[List[Tuple[float, float]]]) -> int:
     """
-    10.3 Rotation support: derive 90-degree increments from polygon.
+    Rotation support: derive 90-degree increments from polygon.
     Polygons from DocInt are [x0,y0, x1,y1, x2,y2, x3,y3].
     """
     if not poly or len(poly) < 2:
@@ -948,7 +948,7 @@ def _derive_rotation(poly: Optional[List[Tuple[float, float]]]) -> int:
     p0, p1 = poly[0], poly[1]
     dx, dy = p1[0] - p0[0], p1[1] - p0[1]
     angle = math.degrees(math.atan2(dy, dx))
-    # Normalize to 0, 90, 180, 270 for PyMuPDF textbox support
+    # normalize to 0, 90, 180, 270 for PyMuPDF textbox support
     return int((round(angle / 90) * 90) % 360)
 
 
@@ -972,9 +972,9 @@ def apply_translations(
 
     _vprint(verbose, f"[APPLY] Dispatching {len(translations)} containers across {len(by_page)} pages")
 
-    # Map fontname -> (fitz.Font, Optional[fontfile_path])
+    # map fontname -> (fitz.Font, Optional[fontfile_path])
     font_resource_cache: Dict[str, Tuple[fitz.Font, Optional[str]]] = {}
-    # Track which fonts are registered on which page indices
+    # track which fonts are registered on which page indices
     page_font_registry: Dict[int, Set[str]] = {}
 
     for page_index, page_plans in by_page.items():
@@ -984,12 +984,12 @@ def apply_translations(
         if page_index not in page_font_registry:
             page_font_registry[page_index] = set()
 
-        # Step 12: Hybrid/Raster Routing
+        # hybrid/raster routing
         raster_plans = [p for p in page_plans if not p.container.original_spans]
         vector_plans = [p for p in page_plans if p.container.original_spans]
 
         if raster_plans:
-            # 11.1 Render to Raster
+            # render to raster
             from scripts.layout.raster_processor import render_page_to_pixmap, inpaint_containers, draw_raster_overlay
             _vprint(verbose, f"[RASTER][PAGE {page_index}] Inpainting {len(raster_plans)} regions...")
 
@@ -998,34 +998,32 @@ def apply_translations(
             sx = pix.width / pref.width
             sy = pix.height / pref.height
 
-            # 11.3 & 11.4 Mask & Inpaint (use word-level MaskRegions when available)
+            # mask & inpaint (use word-level MaskRegions when available)
             raster_conts = [p.container for p in raster_plans]
             page_mask_regions = (mask_regions_by_page or {}).get(page_index, None)
             inpainted_pix = inpaint_containers(
-                pix,
-                raster_conts,
+                pixmap=pix,
+                containers=raster_conts,
+                page_index=page_index,
                 sx=sx,
                 sy=sy,
                 mask_regions=page_mask_regions,
                 verbose=verbose,
             )
 
-            # 11.5/12 Overlay background
+            # overlay background
             draw_raster_overlay(doc, page_index, inpainted_pix)
 
-        # 1) Precise Text Removal (Step 9 / 12)
-        # Even on hybrid pages, we remove vector strokes for mapped containers
-        # 1) Precise Text Removal (Step 9 / 12)
-        # Even on hybrid pages, we remove vector strokes for mapped containers
+        # 1) Precise Text Removal
+        # even on hybrid pages, we remove vector strokes for mapped containers
         if vector_plans:
-            # Create a 72-DPI base pixmap to sample perimeter colors 
-            # so we can dynamically color the redaction fill without causing white boxes.
+            # create a 72-DPI base pixmap to sample perimeter colors so we can dynamically color the redaction fill without causing white boxes.
             bg_pix = page.get_pixmap(dpi=72)
             for plan in vector_plans:
                 span_rects = [fitz.Rect(s.rect) for s in plan.container.original_spans]
                 remove_text(page, span_rects, bg_pix, verbose=verbose)
         
-        # If inpainting didn't happen (RASTER containers but no OpenCV), use bbox fallback
+        # if inpainting didn't happen (RASTER containers but no OpenCV), use bbox fallback
         if raster_plans:
             try:
                 import cv2
@@ -1037,29 +1035,28 @@ def apply_translations(
                     rect = fitz.Rect(plan.container.bbox)
                     page.add_redact_annot(_safe_rect(page, rect, pad=0.1))
 
-        # This removes the original vector text content
+        # this removes the original vector text content
         page.apply_redactions()
 
-        # 2) Typesetting & Style Fidelity (Step 10)
+        # 2) typesetting & style fidelity
         for plan in page_plans:
-            # 10.3 Rotation: preserve polygon angles
+            # rotation: preserve polygon angles
             if plan.container.polygon:
                 plan.rendering_intent.rotation = _derive_rotation(plan.container.polygon)
 
-            # 10.2 Style fidelity: Sample color/style from original spans
+            # style fidelity: sample color/style from original spans
             if plan.container.original_spans:
                 s0 = plan.container.original_spans[0]
                 plan.rendering_intent.color = _int_to_rgb(s0.color)
                 if plan.rendering_intent.font_size_start <= 1e-3:
                     plan.rendering_intent.font_size_start = s0.size
             
-            # Fallback: if we still have no font size (raster or unmatched span),
-            # estimate from the PDF's text layer at the container's bbox location.
+            # fallback: if we still have no font size (raster or unmatched span), estimate from the PDF's text layer at the container's bbox location.
             if plan.rendering_intent.font_size_start <= 1e-3:
                 estimated = _estimate_fontsize_for_rect(page, fitz.Rect(plan.container.bbox), verbose=verbose)
                 plan.rendering_intent.font_size_start = estimated if estimated else 10.0
 
-            # 10.1 Font Strategy (Unicode Fallback)
+            # font strategy (Unicode fallback)
             tgt_text = plan.final_rendered_text
             eff_fontname = plan.rendering_intent.font_name or fontname
             
@@ -1070,20 +1067,19 @@ def apply_translations(
             plan.rendering_intent.font_name = eff_fontname
             fn = plan.rendering_intent.font_name
 
-            # Cache the font object and file globally for the doc
+            # cache the font object and file globally for the doc
             if fn not in font_resource_cache:
                 eff_name, ff = _pick_font(tgt_text, fn, verbose=verbose)
                 mf = _get_measure_font(eff_name, ff, verbose=verbose)
                 font_resource_cache[fn] = (mf, ff)
 
-            # REGISTER on the page every time we move to a new page or usage
+            # register on the page every time we move to a new page or usage
             mf, ff = font_resource_cache[fn]
             if fn not in page_font_registry[page_index]:
                 _ensure_page_font(page, fn, ff, verbose=verbose)
                 page_font_registry[page_index].add(fn)
 
-            # Invoke Step 8: Kind-aware Typesetting
-            # Pass only the measure fonts part to typeset_and_insert
+            # invoke kind-aware typesetting - pass only the measure fonts part to typeset_and_insert
             measure_only_map = {k: v[0] for k, v in font_resource_cache.items()}
             typeset_and_insert(page, fitz.Rect(plan.container.bbox), plan, measure_only_map)
 
@@ -1091,7 +1087,7 @@ def apply_translations(
 
 
 # -----------------------------
-# Paragraph-aware merge / unmerge
+# paragraph-aware merge / unmerge
 # -----------------------------
 _LINE_TAG_RE = re.compile(r"\[L(\d+)\](.*?)\[/L\1\]", re.DOTALL)
 
@@ -1120,15 +1116,15 @@ def _merge_paragraph_groups(
         merged_containers – smaller list of ContainerRefs ready for translation
         merge_map         – one _MergeEntry per merged item (for unmerging later)
     """
-    # Build ordered groups preserving first-seen order
-    group_order: List[Optional[str]] = []          # ordered unique group IDs (None = ungrouped)
-    group_items: Dict[Optional[str], List[int]] = {}  # gid -> list of indices
+    # build ordered groups preserving first-seen order
+    group_order: List[Optional[str]] = []               # ordered unique group IDs (None = ungrouped)
+    group_items: Dict[Optional[str], List[int]] = {}    # gid -> list of indices
     seen_gids: set = set()
 
     for idx, c in enumerate(containers):
         gid = c.paragraph_group_id
         if gid is None:
-            # Each ungrouped item is its own "group" – use a unique key
+            # each ungrouped item is its own "group" – use a unique key
             key = f"__ungrouped_{idx}"
             group_order.append(key)
             group_items[key] = [idx]
@@ -1138,7 +1134,7 @@ def _merge_paragraph_groups(
                 seen_gids.add(gid)
             group_items.setdefault(gid, []).append(idx)
 
-    # Post-process groups: split if there's a large vertical gap between lines
+    # post-process groups: split if there's a large vertical gap between lines
     final_merged_containers: List[ContainerRef] = []
     final_merge_map: List[_MergeEntry] = []
     merged_count = 0
@@ -1146,7 +1142,7 @@ def _merge_paragraph_groups(
     for gid in group_order:
         indices = group_items[gid]
         if len(indices) <= 1:
-            # Singleton – pass through
+            # singleton – pass through
             c = containers[indices[0]]
             final_merged_containers.append(c)
             final_merge_map.append(_MergeEntry(
@@ -1156,18 +1152,17 @@ def _merge_paragraph_groups(
             ))
             continue
 
-        # Split group if vertical gaps are too large or line count is massive
+        # split group if vertical gaps are too large or line count is massive
         sub_groups: List[List[int]] = []
         current_sub: List[int] = [indices[0]]
         for i in range(1, len(indices)):
             prev = containers[indices[i-1]]
             curr = containers[indices[i]]
-            # Vertical gap heuristic: 1.5x line height or 20pt, whichever is smaller context
-            # (or if they are on different pages)
+            # vertical gap heuristic: 1.5x line height or 20pt, whichever is smaller context (or if they are on different pages)
             prev_h = prev.bbox[3] - prev.bbox[1]
             gap = curr.bbox[1] - prev.bbox[3]
             
-            # Massive gap or page break or too many lines (to keep context manageable)
+            # massive gap or page break or too many lines (to keep context manageable)
             if curr.page_index != prev.page_index or gap > max(15.0, prev_h * 1.5) or len(current_sub) >= 20:
                 sub_groups.append(current_sub)
                 current_sub = [indices[i]]
@@ -1177,7 +1172,7 @@ def _merge_paragraph_groups(
 
         for sub_indices in sub_groups:
             if len(sub_indices) == 1:
-                # Became singleton
+                # became singleton
                 c = containers[sub_indices[0]]
                 final_merged_containers.append(c)
                 final_merge_map.append(_MergeEntry(
@@ -1186,7 +1181,7 @@ def _merge_paragraph_groups(
                     merged_container=c,
                 ))
             else:
-                # Multi-line
+                # multi-line
                 parts: List[str] = []
                 bboxes: List[Tuple[float, float, float, float]] = []
                 for line_num, ci in enumerate(sub_indices, start=1):
@@ -1237,14 +1232,14 @@ def _unmerge_paragraph_translations(
     Fallback strategy when delimiters are missing/corrupted:
         1) Try regex parse for all N expected line tags
         2) If partial delimiters found, use them for matched lines and
-           assign remaining text proportionally
+        assign remaining text proportionally
         3) Final fallback: assign the full translated text to every line
     """
     expanded: List[ContainerTranslation] = []
 
     for entry, trans in zip(merge_map, translations):
         if entry.line_count == 1:
-            # Singleton – rewire to original container and pass through
+            # singleton – rewire to original container and pass through
             orig_c = original_containers[entry.original_indices[0]]
             expanded.append(ContainerTranslation(
                 container=orig_c,
@@ -1252,17 +1247,17 @@ def _unmerge_paragraph_translations(
             ))
             continue
 
-        # Multi-line: parse delimiters
+        # multi-line: parse delimiters
         raw = trans.translated_text
         matches = _LINE_TAG_RE.findall(raw)
-        parsed: Dict[int, str] = {}  # 1-indexed line_num -> text
+        parsed: Dict[int, str] = {} # 1-indexed line_num -> text
         for num_str, text in matches:
             parsed[int(num_str)] = text.strip()
 
         n = entry.line_count
 
         if len(parsed) == n and all(i in parsed for i in range(1, n + 1)):
-            # Happy path: all delimiters found
+            # all delimiters found
             for line_num, ci in enumerate(entry.original_indices, start=1):
                 expanded.append(ContainerTranslation(
                     container=original_containers[ci],
@@ -1271,17 +1266,16 @@ def _unmerge_paragraph_translations(
             _vprint(verbose, f"[UNMERGE] group gid={entry.merged_container.paragraph_group_id}: "
                     f"parsed {n}/{n} line tags OK")
         else:
-            # Fallback: delimiters missing or corrupted
-            # Strip ANY remaining tags (even unpaired/malformed ones) before splitting
-            # to prevent [L5] etc. from leaking into the final text.
+            # fallback: delimiters missing or corrupted
+            # strip ANY remaining tags (even unpaired/malformed ones) before splitting to prevent [L5] etc. from leaking into the final text.
             clean = re.sub(r"\[/?L\d+\]", "", raw).strip()
             if not clean:
-                clean = raw  # if stripping removed everything, keep raw
+                clean = raw # if stripping removed everything, keep raw
             
             _vprint(verbose, f"[UNMERGE][FALLBACK] group gid={entry.merged_container.paragraph_group_id}: "
                     f"expected {n} tags, found {len(parsed)}. Using proportional split.")
 
-            # Proportional split by source text length
+            # proportional split by source text length
             src_lengths = [len(original_containers[ci].text) for ci in entry.original_indices]
             total_src = sum(src_lengths) or 1
             trans_len = len(clean)
@@ -1338,8 +1332,6 @@ def _translate_blocks_with_optional_diagnostics(
     """
     Calls translation_service.translate_blocks in a backward-compatible way.
     """
-    # ... (rest of the logic stays similar but uses ContainerRef/ContainerTranslation)
-    # I'll keep the inspect.signature part for robustness
     try:
         sig = inspect.signature(translate_blocks)
         params = sig.parameters
@@ -1353,7 +1345,7 @@ def _translate_blocks_with_optional_diagnostics(
         "return_diagnostics": True
     }
     
-    # Filter kwargs based on what translate_blocks actually accepts
+    # filter kwargs based on what translate_blocks actually accepts
     final_kwargs = {k: v for k, v in kwargs.items() if k in params or not params}
 
     _vprint(verbose, f"[TRANSLATE] Calling translate_blocks with {len(blocks)} chunks")
@@ -1372,7 +1364,7 @@ def translate_pdf_bytes_pipeline(
     filename: str = "document.pdf"
 ) -> bytes:
     """
-    Step 7 & 8: High-fidelity container-based translation pipeline.
+    High-fidelity container-based translation pipeline.
     """
     total_t0 = time.perf_counter()
     extraction_time = translation_time = apply_time = save_time = 0.0
@@ -1384,44 +1376,43 @@ def translate_pdf_bytes_pipeline(
     logger = get_logger()
     logger.start_file_session(filename)
 
-    # Stage 1: Container-first Extraction (Step 7.1)
+    # stage 1: container-first extraction
     t0 = time.perf_counter()
     doc, orig_containers, metadata = extract_all_blocks(pdf_bytes, verbose=verbose)
     extraction_time = time.perf_counter() - t0
     _vprint(verbose, f"[PIPELINE] Extracted {len(orig_containers)} containers in {extraction_time:.2f}s.")
 
-    # Stage 2: Normalization & Policy Attribution (Step 7.3 / 8.3)
+    # stage 2: normalization & policy attribution
     containers_to_translate = []
     translate_idx_map = []
     norm_states = []
     policies = []
 
-    # Track placeholder counters per paragraph group to ensure uniqueness across full context
+    # track placeholder counters per paragraph group to ensure uniqueness across full context
     group_counters = {} 
     group_all_placeholders = {} # gid -> {ph: token}
 
     for i, c in enumerate(orig_containers):
-        # 7.2 Protected-token integrity (part of normalization)
+        # protected-token integrity (part of normalization)
         gid = c.paragraph_group_id or f"__auto_{i}"
         start_ph = group_counters.get(gid, 0)
         
         norm_text, state, next_ph = apply_normalization_pipeline(c.text, start_counter=start_ph)
         group_counters[gid] = next_ph
         
-        # Aggregate placeholders for restoration (so migration between lines within a group is fine)
+        # aggregate placeholders for restoration (so migration between lines within a group is fine)
         if gid not in group_all_placeholders:
             group_all_placeholders[gid] = {}
         group_all_placeholders[gid].update(state.placeholders)
         
-        # 8.3 Kind-aware classification
+        # kind-aware classification
         policy = classify_container(c)
         
         norm_states.append(state)
         policies.append(policy)
         
         if policy != TranslationPolicy.SKIP:
-            # Create normalized clone for translation — must preserve paragraph_group_id
-            # so translation_service can build the per-paragraph context window.
+            # create normalized clone for translation — must preserve paragraph_group_id so translation_service can build the per-paragraph context window.
             c_norm = ContainerRef(
                 page_index=c.page_index,
                 bbox=c.bbox,
@@ -1431,16 +1422,15 @@ def translate_pdf_bytes_pipeline(
                 style_hints=c.style_hints,
                 reading_key=c.reading_key,
                 original_spans=c.original_spans,
-                paragraph_group_id=c.paragraph_group_id,  # ← crucial for LLM1 context
+                paragraph_group_id=c.paragraph_group_id, # crucial for LLM1 context
             )
             containers_to_translate.append(c_norm)
             translate_idx_map.append(i)
 
-    # Stage 3: High-context Translation (Step 7.1 / 7.2)
+    # stage 3: high-context translation
     try:
-        # 3a. Paragraph-aware merge: group lines with shared paragraph_group_id
-        #     into [L1]...[/L1][L2]...[/L2] delimited text so the translator
-        #     sees full paragraph context.
+        # 3a. paragraph-aware merge: group lines with shared paragraph_group_id into
+        # [L1]...[/L1][L2]...[/L2] delimited text so the translator sees full paragraph context.
         merged_containers, merge_map = _merge_paragraph_groups(
             containers_to_translate, verbose=verbose
         )
@@ -1454,12 +1444,12 @@ def translate_pdf_bytes_pipeline(
         )
         translation_time = time.perf_counter() - t1
 
-        # 3b. Unmerge: expand delimited translations back to per-line results
+        # 3b. unmerge: expand delimited translations back to per-line results
         translations = _unmerge_paragraph_translations(
             merged_translations, merge_map, containers_to_translate, verbose=verbose
         )
 
-        # Stage 4: Restore & Map to Plans (Step 7.2 integrity)
+        # stage 4: restore & map to plans
         trans_idx = 0
         plans = []
         from scripts.text_normalization.normalizer import NormalizationState
@@ -1475,17 +1465,17 @@ def translate_pdf_bytes_pipeline(
                 trans_text = translations[trans_idx].translated_text
                 trans_idx += 1
             
-            # Step 7.2: Final restoration of placeholders
-            # Use aggregated placeholders for the group so placeholders migrated by LLM are still restored
+            # final restoration of placeholders
+            # use aggregated placeholders for the group so placeholders migrated by LLM are still restored
             combined_placeholders = group_all_placeholders.get(gid, norm_state.placeholders)
-            # Create a shallow state for restoration that covers the whole paragraph group
+            # create a shallow state for restoration that covers the whole paragraph group
             restoration_state = NormalizationState(original_text=norm_state.original_text, placeholders=combined_placeholders)
             
             final_txt = restore_protected_tokens(trans_text, restoration_state)
             
-            # Build rendering intent (Step 8 basics)
+            # build rendering intent
             intent = RenderingIntent(
-                font_name="helv", # Default, typesetter will refine from style spans
+                font_name="helv", # default, typesetter will refine from style spans
                 font_size_start=0.0, # typesetter will estimate
                 alignment=0 # internal default
             )
@@ -1501,9 +1491,8 @@ def translate_pdf_bytes_pipeline(
             )
             plans.append(plan)
 
-        # --- Logging Stage ---
-        # Build mapping to merged diagnostics
-        # original_idx -> merged_idx
+        # --- logging stage ---
+        # build mapping to merged diagnostics original_idx -> merged_idx
         orig_to_merged = {}
         for midx, entry in enumerate(merge_map):
             for oidx_in_subset in entry.original_indices:
@@ -1533,7 +1522,7 @@ def translate_pdf_bytes_pipeline(
                 gloss_hit = ""
                 
                 if midx is not None:
-                    # Delimited versions from diagnostics
+                    # delimited versions from diagnostics
                     d1 = llm1_map.get(midx, {})
                     d2 = llm2_map.get(midx, {})
                     merged_src = d1.get("original") or d2.get("original") or ""
@@ -1555,7 +1544,7 @@ def translate_pdf_bytes_pipeline(
 
         _print_translation_samples(orig_containers, plans, diagnostics, verbose=verbose)
 
-        # Stage 5: Kind-aware Typesetting (Step 8)
+        # stage 5: kind-aware typesetting
         _vprint(verbose, "[PIPELINE] Applying kind-aware typesetting...")
         t2 = time.perf_counter()
         apply_translations(

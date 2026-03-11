@@ -24,9 +24,9 @@ Required/optional env vars:
 - EMBED_MAX_WORKERS
 """
 
+from dotenv import load_dotenv
 import os, re, uuid, pymupdf, requests, time
 from typing import List, Dict, Tuple, Optional, Iterable
-from dotenv import load_dotenv
 
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import ResourceNotFoundError
@@ -49,7 +49,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # -----------------------------------------------------------------------------
 # CONFIG
 # -----------------------------------------------------------------------------
-
 load_dotenv(override=True)
 
 # Azure OpenAI Embedding endpoint
@@ -57,9 +56,9 @@ AZURE_AI_EMBEDDING_URI = os.environ["AZURE_AI_EMBEDDING_URI"]
 AZURE_AI_EMBEDDING_KEY = os.environ["AZURE_AI_EMBEDDING_KEY"]
 
 # Azure AI Search
-AZURE_AI_SEARCH_URI = os.environ["AZURE_AI_SEARCH_URI"]  # e.g. https://<name>.search.windows.net
+AZURE_AI_SEARCH_URI = os.environ["AZURE_AI_SEARCH_URI"] # e.g. https://<name>.search.windows.net
 AZURE_AI_SEARCH_API_KEY = os.environ["AZURE_AI_SEARCH_API_KEY"]
-AZURE_AI_SEARCH_INDEX_NAME = os.environ["AZURE_AI_SEARCH_INDEX_NAME"]  # e.g. terminology-de
+AZURE_AI_SEARCH_INDEX_NAME = os.environ["AZURE_AI_SEARCH_INDEX_NAME"] # e.g. terminology-de
 
 # Terminology metadata
 TERMINOLOGY_LANG = (os.environ.get("TERMINOLOGY_LANG") or "").strip().lower()
@@ -79,16 +78,13 @@ def _log(msg: str) -> None:
 # -----------------------------------------------------------------------------
 # CLIENTS
 # -----------------------------------------------------------------------------
-
 search_index_client = SearchIndexClient(endpoint=AZURE_AI_SEARCH_URI, credential=AzureKeyCredential(AZURE_AI_SEARCH_API_KEY),)
-
 search_client = SearchClient(endpoint=AZURE_AI_SEARCH_URI, index_name=AZURE_AI_SEARCH_INDEX_NAME, credential=AzureKeyCredential(AZURE_AI_SEARCH_API_KEY),)
 
 
 # -----------------------------------------------------------------------------
 # NORMALIZATION (domains/lang)
 # -----------------------------------------------------------------------------
-
 def normalize_domain(raw: Optional[str]) -> str:
     """
     Normalize domain so it's consistent across ingestion:
@@ -113,12 +109,9 @@ def normalize_lang(raw: str) -> str:
     return (raw or "").strip().lower()
 
 
-
-
 # -----------------------------------------------------------------------------
 # CONCURRENT EMBEDDING HELPERS
 # -----------------------------------------------------------------------------
-
 def _sleep_backoff(attempt: int, base: float = 1.0, cap: float = 30.0) -> None:
     """
     Exponential backoff with jitter-free cap.
@@ -142,11 +135,9 @@ def embed_batch_with_retries(
 
     NOTE: Uses the same endpoint + API key as embed_batch().
     """
-    if not texts:
-        return []
+    if not texts: return []
 
     last_err: Optional[Exception] = None
-
     for attempt in range(1, max_retries + 1):
         try:
             headers = {"Content-Type": "application/json", "api-key": AZURE_AI_EMBEDDING_KEY}
@@ -154,7 +145,7 @@ def embed_batch_with_retries(
 
             resp = requests.post(AZURE_AI_EMBEDDING_URI, headers=headers, json=payload, timeout=timeout_s)
 
-            # Retry-worthy statuses
+            # retry-worthy statuses
             if resp.status_code in (408, 429) or 500 <= resp.status_code <= 599:
                 last_err = RuntimeError(f"Embedding HTTP {resp.status_code}: {resp.text[:300]}")
                 _log(f"[EMBED][RETRY] attempt={attempt}/{max_retries} status={resp.status_code} batch_size={len(texts)} -> backoff")
@@ -211,7 +202,7 @@ def embed_docs_concurrently(
     _log(f"[EMBED] Concurrent embedding: docs={n} batch_size={embed_batch_size} "
         f"batches={total_batches} workers={max_workers}")
 
-    # Will store embeddings per doc index
+    # will store embeddings per doc index
     vectors: List[Optional[List[float]]] = [None] * n
 
     t0 = time.perf_counter()
@@ -231,20 +222,20 @@ def embed_docs_concurrently(
 
         for fut in as_completed(futs):
             batch_no, start, end, embeds = fut.result()
-            # Stitch into correct slots
+            # stitch into correct slots
             for i, vec in enumerate(embeds):
                 vectors[start + i] = vec
 
             completed += 1
 
-            # Progress logging
+            # progress logging
             if completed == 1 or completed % 5 == 0 or completed == total_batches:
                 elapsed = time.perf_counter() - t0
                 rate = completed / elapsed if elapsed > 0 else 0.0
                 _log(f"[EMBED] done {completed}/{total_batches} batches "
                     f"| elapsed={elapsed:.1f}s | ~{rate:.2f} batches/s")
 
-    # Ensure all vectors filled
+    # ensure all vectors filled
     missing = sum(1 for v in vectors if v is None)
     if missing:
         raise RuntimeError(f"[EMBED] Missing vectors for {missing} docs (unexpected).")
@@ -252,7 +243,7 @@ def embed_docs_concurrently(
     out: List[Dict] = []
     for i, d in enumerate(docs):
         dd = dict(d)
-        dd["vector"] = vectors[i]  # type: ignore[assignment]
+        dd["vector"] = vectors[i] # type: ignore[assignment]
         out.append(dd)
     return out
 
@@ -260,7 +251,6 @@ def embed_docs_concurrently(
 # -----------------------------------------------------------------------------
 # INDEX CREATION
 # -----------------------------------------------------------------------------
-
 def create_index_if_not_exists():
     """
     Create the Azure AI Search index for terminology if it doesn't exist.
@@ -320,7 +310,6 @@ def create_index_if_not_exists():
 # -----------------------------------------------------------------------------
 # PARAGRAPH EXTRACTION HELPERS
 # -----------------------------------------------------------------------------
-
 def is_noise_paragraph(text: str) -> bool:
     """
     Heuristics to drop non-content junk from PDFs:
@@ -366,7 +355,6 @@ def _clean_block_text(raw: str) -> str:
 # -----------------------------------------------------------------------------
 # DOMAIN EXTRACTION FROM PDF TOC (top-level only)
 # -----------------------------------------------------------------------------
-
 def extract_top_level_domains_from_pdf_toc(doc: pymupdf.Document) -> List[Tuple[int, str]]:
     """
     Read PDF Table of Contents (TOC) and return top-level entries only.
@@ -378,7 +366,7 @@ def extract_top_level_domains_from_pdf_toc(doc: pymupdf.Document) -> List[Tuple[
     - We do NOT extract sub-domains (levels > 1)
     - If TOC missing or no level-1 entries, returns [] (caller falls back to NONE)
     """
-    toc = doc.get_toc(simple=True)  # list of [level, title, page]
+    toc = doc.get_toc(simple=True) # list of [level, title, page]
     top: List[Tuple[int, str]] = []
 
     for entry in toc or []:
@@ -419,7 +407,6 @@ def domain_for_page(top_domains: List[Tuple[int, str]], page_0based: int) -> str
 # -----------------------------------------------------------------------------
 # PDF extraction returning (paragraph, domain)
 # -----------------------------------------------------------------------------
-
 def extract_paragraphs_from_pdf_with_domain(path: str, domain: str) -> List[Tuple[str, str]]:
     """
     Extract paragraphs from a PDF using PyMuPDF (layout-aware blocks),
@@ -528,7 +515,6 @@ def build_paragraph_docs_from_file(path: str, *, lang: str, domain: str) -> List
 # -----------------------------------------------------------------------------
 # INDEXING
 # -----------------------------------------------------------------------------
-
 def index_paragraph_docs(
     docs: List[Dict],
     embed_batch_size: int = 32,
@@ -597,7 +583,6 @@ def index_paragraph_docs(
 # -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
-
 if __name__ == "__main__":
     start = time.perf_counter()
 
