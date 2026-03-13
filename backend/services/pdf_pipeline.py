@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dotenv import load_dotenv
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import os, fitz, io, re, threading, time, inspect, math # PyMuPDF (used for writing back into the PDF)
 
 # Azure Document Intelligence
@@ -684,9 +684,19 @@ _FONT_BUFFER_CACHE: Dict[str, bytes] = {} # fontfile -> font buffer bytes
 _MEASURE_FONT_LOCK = threading.Lock()
 _MEASURE_FONT_CACHE: Dict[Tuple[str, Optional[str]], fitz.Font] = {}
 # Japanese + CJK detection
-_CJK_RE = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uFF66-\uFF9F]")
+_CJK_RE = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF66-\uFF9F]")
 _PAGE_SPAN_CACHE_LOCK = threading.Lock()
 _PAGE_SPAN_CACHE: Dict[int, List[Tuple[fitz.Rect, float, float]]] = {} # page_no -> (rect, size, weight)
+_BUILTIN_FONT_STATUS_LOCK = threading.Lock()
+_BUILTIN_FONT_STATUS: Dict[str, bool] = {}
+
+
+@dataclass
+class _FontResource:
+    measure_font: fitz.Font
+    fontfile: Optional[str] = None
+    writer_font: Optional[fitz.Font] = None
+    use_textwriter: bool = False
 
 
 def _get_page_style_spans(page: fitz.Page, *, verbose: bool = False) -> List[Tuple[fitz.Rect, float, float]]:
@@ -825,7 +835,77 @@ def _looks_cjk(text: str) -> bool:
     return bool(_CJK_RE.search(text or ""))
 
 
-def _pick_font(text: str, default_fontname: str, *, verbose: bool = False) -> Tuple[str, Optional[str]]:
+def _norm_lang_code(lang: Optional[str]) -> str:
+    t = (lang or "").strip().lower()
+    if not t:
+        return ""
+    mapping = {
+        "english": "en",
+        "japanese": "ja",
+        "chinese": "zh",
+        "korean": "ko",
+    }
+    t = mapping.get(t, t)
+    return t
+
+
+def _reserved_cjk_font_for_lang(lang: Optional[str]) -> Optional[str]:
+    code = _norm_lang_code(lang)
+    if not code:
+        return None
+    if code.startswith("ja"):
+        return "japan"
+    if code.startswith("ko"):
+        return "korea"
+    if code.startswith(("zh-tw", "zh-hk", "zh-mo", "zh-hant")):
+        return "china-t"
+    if code.startswith("zh"):
+        return "china-s"
+    return None
+
+
+def _resolve_cjk_font(text: str, *, target_lang: Optional[str] = None, verbose: bool = False) -> fitz.Font:
+    fontname = _reserved_cjk_font_for_lang(target_lang) or "cjk"
+    _vprint(verbose, f"[FONT] Using TextWriter CJK font '{fontname}' for target_lang={target_lang!r}")
+    try:
+        return fitz.Font(fontname)
+    except Exception:
+        _vprint(verbose, f"[FONT] Failed to load CJK font '{fontname}', falling back to 'cjk'")
+        return fitz.Font("cjk")
+
+
+def _is_builtin_font(fontname: str) -> bool:
+    candidate = (fontname or "").strip()
+    if not candidate:
+        return False
+    with _BUILTIN_FONT_STATUS_LOCK:
+        cached = _BUILTIN_FONT_STATUS.get(candidate)
+        if cached is not None:
+            return cached
+    try:
+        fitz.Font(fontname=candidate)
+        ok = True
+    except Exception:
+        ok = False
+    with _BUILTIN_FONT_STATUS_LOCK:
+        _BUILTIN_FONT_STATUS[candidate] = ok
+    return ok
+
+
+def _existing_font_path(*paths: str) -> Optional[str]:
+    for path in paths:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def _pick_font(
+    text: str,
+    default_fontname: str,
+    *,
+    target_lang: Optional[str] = None,
+    verbose: bool = False,
+) -> Tuple[str, Optional[str]]:
     """
     Choose a font + fontfile. Returns (fontname, fontfile_or_None).
 
@@ -841,30 +921,39 @@ def _pick_font(text: str, default_fontname: str, *, verbose: bool = False) -> Tu
         return chosen
 
     if _looks_cjk(text):
-        _vprint(verbose, "[FONT] Detected CJK chars in text")
-        cjk = (os.getenv("PDF_CJK_FONT_FILE", "") or "").strip()
-        if cjk and os.path.exists(cjk):
-            _vprint(verbose, f"[FONT] Using CJK font from env PDF_CJK_FONT_FILE: {cjk}")
-            return _sanitize_fontname(os.path.splitext(os.path.basename(cjk))[0]), cjk
+        resolved = _resolve_cjk_font(text, target_lang=target_lang, verbose=verbose)
+        return resolved.name, None
 
-        # common Windows JP fonts (best-effort)
-        win_candidates = [
-            r"C:\Windows\Fonts\meiryo.ttc",
-            r"C:\Windows\Fonts\msgothic.ttc",
-            r"C:\Windows\Fonts\YuGothR.ttc",
-            r"C:\Windows\Fonts\yugothic.ttf",
-            r"C:\Windows\Fonts\arialuni.ttf",
-        ]
-        for p in win_candidates:
-            if os.path.exists(p):
-                _vprint(verbose, f"[FONT] Using fallback Windows CJK font: {p}")
-                return _sanitize_fontname(os.path.splitext(os.path.basename(p))[0]), p
+    resolved_default = default_fontname if _is_builtin_font(default_fontname) else "helv"
+    if resolved_default != default_fontname:
+        _vprint(verbose, f"[FONT] Default font '{default_fontname}' unavailable; using '{resolved_default}'")
+    else:
+        _vprint(verbose, f"[FONT] Non-CJK text; using default font '{resolved_default}'")
+    return resolved_default, None
 
-        _vprint(verbose, f"[FONT] CJK text detected but no CJK font found; falling back to '{default_fontname}'")
-        return default_fontname, None
 
-    _vprint(verbose, f"[FONT] Non-CJK text; using default font '{default_fontname}'")
-    return default_fontname, None
+def _resolve_font_resource(
+    text: str,
+    default_fontname: str,
+    *,
+    target_lang: Optional[str] = None,
+    verbose: bool = False,
+) -> Tuple[str, _FontResource]:
+    if _looks_cjk(text):
+        writer_font = _resolve_cjk_font(text, target_lang=target_lang, verbose=verbose)
+        return writer_font.name, _FontResource(
+            measure_font=writer_font,
+            writer_font=writer_font,
+            use_textwriter=True,
+        )
+
+    eff_name, fontfile = _pick_font(text, default_fontname, target_lang=target_lang, verbose=verbose)
+    measure_font = _get_measure_font(eff_name, fontfile, verbose=verbose)
+    return eff_name, _FontResource(
+        measure_font=measure_font,
+        fontfile=fontfile,
+        use_textwriter=False,
+    )
 
 
 def _get_measure_font(fontname: str, fontfile: Optional[str], *, verbose: bool = False) -> fitz.Font:
@@ -893,6 +982,19 @@ def _get_measure_font(fontname: str, fontfile: Optional[str], *, verbose: bool =
             
         _MEASURE_FONT_CACHE[key] = f
         return f
+
+
+def _finalize_pdf_fonts(doc: fitz.Document, *, verbose: bool = False) -> None:
+    """
+    Finalize embedded fonts before serializing the document.
+    Subsetting reduces font payloads and lets MuPDF rebuild font programs
+    for the exact glyph set referenced by inserted text.
+    """
+    try:
+        _vprint(verbose, "[FONT] Running doc.subset_fonts() before save")
+        doc.subset_fonts(verbose=False, fallback=False)
+    except Exception as e:
+        _vprint(verbose, f"[FONT] subset_fonts skipped: {e!r}")
 
 
 def remove_text(page: fitz.Page, rects: List[fitz.Rect], pix: fitz.Pixmap, verbose: bool = False):
@@ -956,6 +1058,7 @@ def apply_translations(
     doc: fitz.Document,
     translations: List[TranslationPlan],
     *,
+    target_lang: Optional[str] = None,
     fontname: str = "helv",
     fontsize: float = 11,
     mask_regions_by_page: Optional[Dict[int, Any]] = None,
@@ -972,8 +1075,8 @@ def apply_translations(
 
     _vprint(verbose, f"[APPLY] Dispatching {len(translations)} containers across {len(by_page)} pages")
 
-    # map fontname -> (fitz.Font, Optional[fontfile_path])
-    font_resource_cache: Dict[str, Tuple[fitz.Font, Optional[str]]] = {}
+    # map resolved fontname -> font resource used for measuring and rendering
+    font_resource_cache: Dict[str, _FontResource] = {}
     # track which fonts are registered on which page indices
     page_font_registry: Dict[int, Set[str]] = {}
 
@@ -1058,30 +1161,35 @@ def apply_translations(
 
             # font strategy (Unicode fallback)
             tgt_text = plan.final_rendered_text
-            eff_fontname = plan.rendering_intent.font_name or fontname
-            
-            from scripts.layout.typesetter import _looks_cjk
-            if _looks_cjk(tgt_text):
-                eff_fontname = "notosans"
-            
-            plan.rendering_intent.font_name = eff_fontname
-            fn = plan.rendering_intent.font_name
+            requested_fontname = plan.rendering_intent.font_name or fontname
+            resolved_fontname, resource = _resolve_font_resource(
+                tgt_text,
+                requested_fontname,
+                target_lang=target_lang,
+                verbose=verbose,
+            )
+            plan.rendering_intent.font_name = resolved_fontname
 
             # cache the font object and file globally for the doc
-            if fn not in font_resource_cache:
-                eff_name, ff = _pick_font(tgt_text, fn, verbose=verbose)
-                mf = _get_measure_font(eff_name, ff, verbose=verbose)
-                font_resource_cache[fn] = (mf, ff)
+            if resolved_fontname not in font_resource_cache:
+                font_resource_cache[resolved_fontname] = resource
 
             # register on the page every time we move to a new page or usage
-            mf, ff = font_resource_cache[fn]
-            if fn not in page_font_registry[page_index]:
-                _ensure_page_font(page, fn, ff, verbose=verbose)
-                page_font_registry[page_index].add(fn)
+            resource = font_resource_cache[resolved_fontname]
+            if (not resource.use_textwriter) and resolved_fontname not in page_font_registry[page_index]:
+                _ensure_page_font(page, resolved_fontname, resource.fontfile, verbose=verbose)
+                page_font_registry[page_index].add(resolved_fontname)
 
-            # invoke kind-aware typesetting - pass only the measure fonts part to typeset_and_insert
-            measure_only_map = {k: v[0] for k, v in font_resource_cache.items()}
-            typeset_and_insert(page, fitz.Rect(plan.container.bbox), plan, measure_only_map)
+            # invoke kind-aware typesetting - CJK uses TextWriter with a real fitz.Font object
+            measure_only_map = {k: v.measure_font for k, v in font_resource_cache.items()}
+            typeset_and_insert(
+                page,
+                fitz.Rect(plan.container.bbox),
+                plan,
+                measure_only_map,
+                writer_font=resource.writer_font,
+                prefer_textwriter=resource.use_textwriter,
+            )
 
     _vprint(verbose, "[APPLY] Completed typesetting for all containers.")
 
@@ -1550,13 +1658,15 @@ def translate_pdf_bytes_pipeline(
         apply_translations(
             doc,
             plans,
+            target_lang=target_lang,
             mask_regions_by_page=metadata.get("mask_regions_by_page"),
             verbose=verbose,
         )
         apply_time = time.perf_counter() - t2
 
         t3 = time.perf_counter()
-        out_bytes = doc.tobytes(deflate=True, garbage=4)
+        _finalize_pdf_fonts(doc, verbose=verbose)
+        out_bytes = doc.tobytes(deflate=True, garbage=4, use_objstms=1)
         save_time = time.perf_counter() - t3
 
         total_time = time.perf_counter() - total_t0

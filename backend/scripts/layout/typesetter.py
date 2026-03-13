@@ -146,10 +146,123 @@ def _int_to_rgb(color_int: int):
     return (r, g, b)
 
 
+def _resolve_textbox_layout(
+    plan: TranslationPlan,
+    rect: fitz.Rect,
+) -> tuple[fitz.Rect, ContainerKind, int, float, float, float]:
+    intent = plan.rendering_intent
+    r_obj = fitz.Rect(rect)
+    kind = plan.container.kind
+
+    if kind in (ContainerKind.PARAGRAPH, ContainerKind.LIST_ITEM):
+        r_obj.y1 += min(30.0, r_obj.height * 0.6)
+
+    lineheight_factor = 1.12
+    align = intent.alignment
+    fs = max(5.0, intent.font_size_start)
+    min_fontsize = 4.0
+
+    if kind == ContainerKind.TABLE_CELL:
+        min_fontsize = 3.5
+    elif kind == ContainerKind.LABEL:
+        min_fontsize = 4.0
+        align = 1
+    elif kind == ContainerKind.HEADER_FOOTER:
+        min_fontsize = max(6.0, fs * 0.8)
+    else:
+        min_fontsize = 5.0
+
+    max_w = max(1.0, r_obj.width - 0.2)
+    return r_obj, kind, align, fs, min_fontsize, lineheight_factor
+
+
+def _fit_text_lines(
+    text: str,
+    rect: fitz.Rect,
+    kind: ContainerKind,
+    font: fitz.Font,
+    fs: float,
+    min_fontsize: float,
+    max_w: float,
+    lineheight_factor: float,
+    *,
+    cjk_mode: bool,
+) -> tuple[float, List[str]]:
+    while fs >= min_fontsize - 1e-6:
+        raw_lines = _wrap_text_to_width(text, font, fs, max_w, cjk_mode=cjk_mode)
+        max_lines_possible = max(1, int(rect.height / (fs * lineheight_factor)))
+
+        if len(raw_lines) > max_lines_possible:
+            if kind == ContainerKind.HEADER_FOOTER and fs <= min_fontsize + 0.5:
+                break
+
+            fs_est = rect.height / (len(raw_lines) * lineheight_factor)
+            new_fs = max(min_fontsize, min(fs - 0.5, fs_est))
+            if fs - new_fs < 0.2:
+                break
+            fs = new_fs
+            continue
+
+        return fs, raw_lines
+
+    fs = min_fontsize
+    raw_lines = _wrap_text_to_width(text, font, fs, max_w, cjk_mode=cjk_mode)
+    max_lines_possible = max(1, int(rect.height / (fs * lineheight_factor)))
+    return fs, _truncate_lines_to_height(raw_lines, font, fs, max_w, max_lines_possible)
+
+
+def typeset_and_insert_cjk(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    plan: TranslationPlan,
+    writer_font: fitz.Font,
+) -> bool:
+    text = plan.final_rendered_text.strip()
+    if not text:
+        return False
+
+    intent = plan.rendering_intent
+    r_obj, kind, align, fs, min_fontsize, lineheight_factor = _resolve_textbox_layout(plan, rect)
+    max_w = max(1.0, r_obj.width - 0.2)
+    fs, lines = _fit_text_lines(
+        text,
+        r_obj,
+        kind,
+        writer_font,
+        fs,
+        min_fontsize,
+        max_w,
+        lineheight_factor,
+        cjk_mode=True,
+    )
+    wrapped = "\n".join(lines).strip()
+    if not wrapped:
+        return False
+
+    tw = fitz.TextWriter(page.rect)
+    try:
+        tw.fill_textbox(
+            r_obj,
+            wrapped,
+            font=writer_font,
+            fontsize=fs,
+            lineheight=lineheight_factor,
+            align=align,
+            right_to_left=_looks_rtl(text),
+        )
+        tw.write_text(page, color=intent.color, overlay=True)
+        return True
+    except Exception:
+        return False
+
+
 def typeset_and_insert_spans(
     page: fitz.Page,
     plan: TranslationPlan,
     font_map: dict,  # dict of fontname -> fitz.Font for measuring
+    *,
+    writer_font: Optional[fitz.Font] = None,
+    prefer_textwriter: bool = False,
 ) -> bool:
     """
     Span-level origin-based text insertion for precise layout fidelity.
@@ -229,8 +342,8 @@ def typeset_and_insert_spans(
                     offset += chunk_len
 
     # ── insert each visual line at its origin ──
-    shape = page.new_shape()
     cjk_mode = _looks_cjk(text)
+    shape = page.new_shape()
 
     for vl_idx, (vl_spans, lt) in enumerate(zip(visual_lines, line_texts)):
         if not lt:
@@ -264,6 +377,21 @@ def typeset_and_insert_spans(
             # shift up slightly so baseline stays roughly in the same place
             origin = fitz.Point(origin.x, origin.y)
 
+        if prefer_textwriter and writer_font is not None:
+            tw = fitz.TextWriter(page.rect)
+            try:
+                tw.append(
+                    origin,
+                    lt,
+                    font=writer_font,
+                    fontsize=fs,
+                    right_to_left=_looks_rtl(lt),
+                )
+                tw.write_text(page, color=color, overlay=True)
+            except Exception:
+                return False
+            continue
+
         shape.insert_text(
             origin,
             lt,
@@ -272,7 +400,8 @@ def typeset_and_insert_spans(
             color=color,
         )
 
-    shape.commit(overlay=True)
+    if not (prefer_textwriter and writer_font is not None):
+        shape.commit(overlay=True)
     return True
 
 
@@ -280,7 +409,10 @@ def typeset_and_insert(
     page: fitz.Page, 
     rect: fitz.Rect, 
     plan: TranslationPlan,
-    font_map: dict # dict of fontname -> fitz.Font for measuring
+    font_map: dict, # dict of fontname -> fitz.Font for measuring
+    *,
+    writer_font: Optional[fitz.Font] = None,
+    prefer_textwriter: bool = False,
 ) -> bool:
     """Implement kind-aware typesetting policies.
     
@@ -307,10 +439,19 @@ def typeset_and_insert(
             use_spans = True
 
     if use_spans:
-        ok = typeset_and_insert_spans(page, plan, font_map)
+        ok = typeset_and_insert_spans(
+            page,
+            plan,
+            font_map,
+            writer_font=writer_font,
+            prefer_textwriter=prefer_textwriter,
+        )
         if ok:
             return True
         # fall through to textbox if span path fails
+
+    if prefer_textwriter and writer_font is not None:
+        return typeset_and_insert_cjk(page, rect, plan, writer_font)
 
     # ── textbox-based path (raster / fallback) ──
     intent = plan.rendering_intent
@@ -319,66 +460,27 @@ def typeset_and_insert(
     if not mf:
         # fallback measure font
         mf = fitz.Font("helv")
-        
     cjk_mode = _looks_cjk(text)
-    r_obj = fitz.Rect(rect)
-    
-    # kind-aware policy bindings
-    kind = plan.container.kind
-    
-    # apply vertical slack for prose to avoid aggressive shrinking/truncation
-    if kind in (ContainerKind.PARAGRAPH, ContainerKind.LIST_ITEM):
-        # allow expansion downwards by up to 60% of original height or 30pt
-        # this gives the translation room to wrap instead of becoming tiny.
-        r_obj.y1 += min(30.0, r_obj.height * 0.6)
-
+    r_obj, kind, align, fs, min_fontsize, lineheight_factor = _resolve_textbox_layout(plan, rect)
     max_w = max(1.0, r_obj.width - 0.2)
-    lineheight_factor = 1.12
-    
-    align = intent.alignment
-    fs = max(5.0, intent.font_size_start)
-    min_fontsize = 4.0
-    
-    if kind == ContainerKind.TABLE_CELL:
-        # aggressive shrink, conservative wrap, no overflow
-        min_fontsize = 3.5
-    elif kind == ContainerKind.LABEL:
-        # aggressive shrink, minimal lines
-        min_fontsize = 4.0
-        align = 1 # Force center alignment often for labels
-    elif kind == ContainerKind.HEADER_FOOTER:
-        # preserve size, minimal shrink
-        min_fontsize = max(6.0, fs * 0.8)
-    else: # PARAGRAPH / LIST_ITEM
-        min_fontsize = 5.0
-        
     shape = page.new_shape()
-    
     while fs >= min_fontsize - 1e-6:
         raw_lines = _wrap_text_to_width(text, mf, fs, max_w, cjk_mode=cjk_mode)
-        max_lines_possible = max(1, int(rect.height / (fs * lineheight_factor)))
-        
+        max_lines_possible = max(1, int(r_obj.height / (fs * lineheight_factor)))
         if len(raw_lines) > max_lines_possible:
             if kind == ContainerKind.HEADER_FOOTER and fs <= min_fontsize + 0.5:
-                # if header/footer can't shrink more, just break and truncate
                 break
-                
-            # compute new FS aggressively based on overshoot
-            fs_est = rect.height / (len(raw_lines) * lineheight_factor)
+            fs_est = r_obj.height / (len(raw_lines) * lineheight_factor)
             new_fs = max(min_fontsize, min(fs - 0.5, fs_est))
-            
             if fs - new_fs < 0.2:
-                # bottomed out the ladder
                 break
-                
             fs = new_fs
             continue
-            
         # try fitz's native textbox using computed constraints
         wrapped = "\n".join(raw_lines).strip()
         try:
             rc = shape.insert_textbox(
-                rect,
+                r_obj,
                 wrapped,
                 fontname=fontname,
                 fontsize=fs,
@@ -399,7 +501,7 @@ def typeset_and_insert(
     # if we exit the loop, we could not fit text without overflow at `min_fontsize`, so we MUST truncate.
     fs = min_fontsize
     raw_lines = _wrap_text_to_width(text, mf, fs, max_w, cjk_mode=cjk_mode)
-    max_lines_possible = max(1, int(rect.height / (fs * lineheight_factor)))
+    max_lines_possible = max(1, int(r_obj.height / (fs * lineheight_factor)))
     
     # truncate fallback
     truncated = _truncate_lines_to_height(raw_lines, mf, fs, max_w, max_lines_possible)
@@ -407,7 +509,7 @@ def typeset_and_insert(
     
     try:
         rc = shape.insert_textbox(
-            rect,
+            r_obj,
             wrapped,
             fontname=fontname,
             fontsize=fs,
@@ -422,7 +524,7 @@ def typeset_and_insert(
         pass
         
     # absolute zero-fallback (just insert at point with no bounds check)
-    start_pt = fitz.Point(rect.x0, rect.y0 + fs)
+    start_pt = fitz.Point(r_obj.x0, r_obj.y0 + fs)
     shape.insert_text(start_pt, "\n".join(truncated), fontname=fontname, fontsize=fs, lineheight=lineheight_factor)
     shape.commit(overlay=True)
     return True
