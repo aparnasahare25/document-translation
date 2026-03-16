@@ -129,11 +129,13 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
             bb = _scale_bbox(bb, sx, sy)
             if _bbox_area(bb) < 2.0: continue
 
-            # skip lines that overlap table cells (>40% of line area)
-            l_area = _bbox_area(bb)
+            # skip lines that belong inside table cells (to avoid double-extraction) using center-point containment
+            mid_x = (bb[0] + bb[2]) / 2.0
+            mid_y = (bb[1] + bb[3]) / 2.0
             overlap = False
             for tb in tb_boxes:
-                if _bbox_overlap_area(bb, tb) > 0.4 * l_area:
+                # tb is (x0, y0, x1, y1)
+                if tb[0] <= mid_x <= tb[2] and tb[1] <= mid_y <= tb[3]:
                     overlap = True
                     break
             if overlap: continue
@@ -168,11 +170,11 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
         body_lines.sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))
 
         # -------------------------------------------------------
-        # GROUP body lines into paragraph groups for context only.
-        # Grouping criteria (same as before):
+        # GROUP body lines into paragraph groups for context only
+        # grouping criteria:
         #   - vertical gap < 1.5× line height
         #   - meaningful horizontal overlap OR close left edge
-        # Each LINE still gets its own bbox — we just share the group ID.
+        # each LINE still gets its own bbox just group ID is shared
         # -------------------------------------------------------
         groups: List[List[Dict]] = []
         current_group: List[Dict] = []
@@ -247,13 +249,22 @@ def build_containers(doc: fitz.Document, analyze_result, verbose: bool = False) 
     # -------------------------
     # 4. final global sort: page -> header/footer first -> reading order
     # -------------------------
-    containers.sort(key=lambda c: (
-        c.page_index,
-        0 if c.kind == ContainerKind.HEADER_FOOTER else 1,
-        c.reading_key,
-        c.bbox[1],
-        c.bbox[0],
-    ))
+    def sort_key(c: ContainerRef):
+        # heades/footers go first
+        kind_priority = 0 if c.kind == ContainerKind.HEADER_FOOTER else 1
+
+        # for table cells, using explicit row/col indices from DocInt to guarantee perfect reading order and ignore bounding box jitter
+        # using a tuple so it's comparable with the single reading_key int of paragraphs
+        if c.kind == ContainerKind.TABLE_CELL:
+            r_idx = c.style_hints.get("row_index", 0) if c.style_hints else 0
+            c_idx = c.style_hints.get("column_index", 0) if c.style_hints else 0
+            order_token = (1, r_idx, c_idx) # the '1' separates it from paragraph keys
+        else:
+            order_token = (0, c.reading_key, 0)
+            
+        return (c.page_index, kind_priority, order_token, c.bbox[1], c.bbox[0],)
+    
+    containers.sort(key=sort_key)
 
     # -------------------------
     # 5. span mapping (for precise text removal)
@@ -287,7 +298,7 @@ def map_spans_to_containers(doc: fitz.Document, containers: List[ContainerRef], 
 
                     # assign span to the container with the most overlap
                     best_c = None
-                    best_overlap = 0.3 * s_area # Lowered from 0.5 to be more robust
+                    best_overlap = 0.3 * s_area # lowered from 0.5 to be more robust
                     for c in page_containers:
                         overlap = _bbox_overlap_area(s_bbox, c.bbox)
                         if overlap > best_overlap:

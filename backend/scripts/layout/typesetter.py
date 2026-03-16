@@ -1,8 +1,8 @@
-import fitz
-import re
+import fitz, re
 from typing import List, Optional
 
 from scripts.layout.containers import TranslationPlan, ContainerKind
+
 
 def _looks_cjk(text: str) -> bool:
     for ch in text:
@@ -10,6 +10,7 @@ def _looks_cjk(text: str) -> bool:
             '\u30a0' <= ch <= '\u30ff' or '\uac00' <= ch <= '\ud7af'):
             return True
     return False
+
 
 def _looks_rtl(text: str) -> bool:
     """Detect if text contains RTL characters (Hebrew, Arabic, etc.)"""
@@ -23,6 +24,7 @@ def _looks_rtl(text: str) -> bool:
             return True
     return False
 
+
 def _bidirectional_shape(text: str) -> str:
     """
     Placeholder for shaping and BIDI reordering.
@@ -30,6 +32,7 @@ def _bidirectional_shape(text: str) -> str:
     """
     # return bidi_algorithm.get_display(reshaper.reshape(text))
     return text
+
 
 def _wrap_text_to_width(text: str, font: fitz.Font, fontsize: float, max_width: float, cjk_mode: bool) -> List[str]:
     """
@@ -125,18 +128,6 @@ def _wrap_text_to_width(text: str, font: fitz.Font, fontsize: float, max_width: 
     print(f"Wrapped text to width: max_width={max_width}, original_len={len(text)}, lines={len(lines)}")
     return lines
 
-def _truncate_lines_to_height(lines: List[str], font: fitz.Font, fontsize: float, max_width: float, max_lines: int) -> List[str]:
-    """Ensure at most max_lines. If truncated, add ellipsis to last line."""
-    if max_lines <= 0: return []
-    if len(lines) <= max_lines: return lines
-    out = lines[:max_lines]
-    last = out[-1]
-    ell = "…"
-    while last and float(font.text_length(last + ell, fontsize=fontsize)) > max_width:
-        last = last[:-1]
-    out[-1] = (last + ell) if last else ell
-    print(f"Truncating to height: max_lines={max_lines}, original_lines={len(lines)}, truncated_lines={len(out)}")
-    return out
 
 def _int_to_rgb(color_int: int):
     """Convert integer color to (r, g, b) floats."""
@@ -154,8 +145,6 @@ def _resolve_textbox_layout(
     r_obj = fitz.Rect(rect)
     kind = plan.container.kind
 
-    if kind in (ContainerKind.PARAGRAPH, ContainerKind.LIST_ITEM):
-        r_obj.y1 += min(30.0, r_obj.height * 0.6)
 
     lineheight_factor = 1.12
     align = intent.alignment
@@ -205,10 +194,10 @@ def _fit_text_lines(
 
         return fs, raw_lines
 
+    # could not fit at min_fontsize within the bbox height - render all lines at min_fontsize anyway; content is never truncated
     fs = min_fontsize
     raw_lines = _wrap_text_to_width(text, font, fs, max_w, cjk_mode=cjk_mode)
-    max_lines_possible = max(1, int(rect.height / (fs * lineheight_factor)))
-    return fs, _truncate_lines_to_height(raw_lines, font, fs, max_w, max_lines_possible)
+    return fs, raw_lines
 
 
 def typeset_and_insert_cjk(
@@ -355,22 +344,20 @@ def typeset_and_insert_spans(
         base_fs = max(first_span.size, 4.0)
         color = _int_to_rgb(first_span.color)
 
-        # progressive font shrinking if text is too wide
+        # progressive font shrinking if text is too wide — never truncate content
         fs = base_fs
         min_fs = max(3.5, base_fs * 0.45)
         text_w = float(mf.text_length(lt, fontsize=fs))
 
-        while text_w > available_w and fs > min_fs:
-            fs = max(min_fs, fs - 0.5)
-            text_w = float(mf.text_length(lt, fontsize=fs))
-
-        # if still too wide, truncate with ellipsis
         if text_w > available_w:
-            ell = "…"
-            truncated = lt
-            while truncated and float(mf.text_length(truncated + ell, fontsize=fs)) > available_w:
-                truncated = truncated[:-1]
-            lt = (truncated + ell) if truncated else ell
+            # jump-start: one-shot ratio estimate, then fine-tune in small steps
+            ratio = available_w / text_w
+            fs = max(min_fs, base_fs * ratio * 0.97)  # 3% safety margin
+            text_w = float(mf.text_length(lt, fontsize=fs))
+            while text_w > available_w and fs > min_fs:
+                fs = max(min_fs, fs - 0.25)
+                text_w = float(mf.text_length(lt, fontsize=fs))
+        # if still slightly over at min_fs, accept minor right overflow (content preserved)
 
         # adjust origin Y if font size changed (keep baseline visually close)
         if abs(fs - base_fs) > 0.1:
@@ -496,17 +483,11 @@ def typeset_and_insert(
             pass
             
         fs -= 0.5
-        
-    # final fallback - hard truncate
-    # if we exit the loop, we could not fit text without overflow at `min_fontsize`, so we MUST truncate.
+
+    # could not fit at any font size via insert_textbox - render ALL lines at min_fontsize with no truncation
     fs = min_fontsize
     raw_lines = _wrap_text_to_width(text, mf, fs, max_w, cjk_mode=cjk_mode)
-    max_lines_possible = max(1, int(r_obj.height / (fs * lineheight_factor)))
-    
-    # truncate fallback
-    truncated = _truncate_lines_to_height(raw_lines, mf, fs, max_w, max_lines_possible)
-    wrapped = "\n".join(truncated).strip()
-    
+    wrapped = "\n".join(raw_lines).strip()
     try:
         rc = shape.insert_textbox(
             r_obj,
@@ -522,9 +503,9 @@ def typeset_and_insert(
             return True
     except:
         pass
-        
-    # absolute zero-fallback (just insert at point with no bounds check)
+
+    # absolute last resort: insert_text at point, all lines, no clipping
     start_pt = fitz.Point(r_obj.x0, r_obj.y0 + fs)
-    shape.insert_text(start_pt, "\n".join(truncated), fontname=fontname, fontsize=fs, lineheight=lineheight_factor)
+    shape.insert_text(start_pt, wrapped, fontname=fontname, fontsize=fs, lineheight=lineheight_factor)
     shape.commit(overlay=True)
     return True

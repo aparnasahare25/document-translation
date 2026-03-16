@@ -626,7 +626,7 @@ def extract_all_blocks(pdf_bytes: bytes, *, verbose: bool = False) -> Tuple[fitz
     Returns:
         - open fitz doc (caller will write into it)
         - extracted blocks list as ContainerRef
-        - metadata dict (includes 'mask_regions_by_page' for inpainting)
+        - metadata dict
     """
     t0 = time.perf_counter()
     _vprint(verbose, f"[PIPELINE][EXTRACT] Opening PDF bytes (size={len(pdf_bytes)} bytes)")
@@ -653,23 +653,14 @@ def extract_all_blocks(pdf_bytes: bytes, *, verbose: bool = False) -> Tuple[fitz
     t_di_end = time.perf_counter()
     _vprint(verbose, f"[DOCINT] analyze_result received in {t_di_end - t_di_start:.2f}s")
 
-    # translate containers, not lines
+    # build containers from DocInt result
     blocks = build_containers(doc, analyze_result, verbose=verbose)
-
-    # build word-level mask regions (used for glyph-accurate inpainting)
-    from scripts.layout.raster_processor import build_mask_regions_from_analyze_result
-    mask_regions_by_page = build_mask_regions_from_analyze_result(
-        doc, analyze_result, verbose=verbose
-    )
-    _vprint(verbose, f"[PIPELINE][EXTRACT] mask_regions built for {len(mask_regions_by_page)} pages")
 
     # metadata for the pipeline (routing, etc.)
     metadata = {
         "page_count": doc.page_count,
         "analyze_result": analyze_result,
         "timing_di_seconds": t_di_end - t_di_start,
-        # per-page word-level mask primitives (dict: page_index -> List[MaskRegion])
-        "mask_regions_by_page": mask_regions_by_page,
     }
 
     _vprint(verbose, f"[PIPELINE][EXTRACT] Completed container extraction in {time.perf_counter() - t0:.2f}s (blocks={len(blocks)})")
@@ -1061,13 +1052,11 @@ def apply_translations(
     target_lang: Optional[str] = None,
     fontname: str = "helv",
     fontsize: float = 11,
-    mask_regions_by_page: Optional[Dict[int, Any]] = None,
     verbose: bool = False,
 ) -> None:
     """
-    Overlay mode with precision vector removal (Step 9) and style sampling (Step 10).
-    mask_regions_by_page: dict[page_index -> List[MaskRegion]] built from DocInt words.
-    If supplied, inpainting uses glyph-accurate masking (A–D improvements).
+    Overlay mode with precision vector removal and style sampling.
+    Removes original PDF text spans via redaction and overlays translated text.
     """
     by_page: Dict[int, List[TranslationPlan]] = {}
     for t in translations:
@@ -1087,56 +1076,12 @@ def apply_translations(
         if page_index not in page_font_registry:
             page_font_registry[page_index] = set()
 
-        # hybrid/raster routing
-        raster_plans = [p for p in page_plans if not p.container.original_spans]
-        vector_plans = [p for p in page_plans if p.container.original_spans]
-
-        if raster_plans:
-            # render to raster
-            from scripts.layout.raster_processor import render_page_to_pixmap, inpaint_containers, draw_raster_overlay
-            _vprint(verbose, f"[RASTER][PAGE {page_index}] Inpainting {len(raster_plans)} regions...")
-
-            pix = render_page_to_pixmap(page, dpi=300)
-            pref = fitz.Rect(page.rect)
-            sx = pix.width / pref.width
-            sy = pix.height / pref.height
-
-            # mask & inpaint (use word-level MaskRegions when available)
-            raster_conts = [p.container for p in raster_plans]
-            page_mask_regions = (mask_regions_by_page or {}).get(page_index, None)
-            inpainted_pix = inpaint_containers(
-                pixmap=pix,
-                containers=raster_conts,
-                page_index=page_index,
-                sx=sx,
-                sy=sy,
-                mask_regions=page_mask_regions,
-                verbose=verbose,
-            )
-
-            # overlay background
-            draw_raster_overlay(doc, page_index, inpainted_pix)
-
-        # 1) Precise Text Removal
-        # even on hybrid pages, we remove vector strokes for mapped containers
-        if vector_plans:
-            # create a 72-DPI base pixmap to sample perimeter colors so we can dynamically color the redaction fill without causing white boxes.
-            bg_pix = page.get_pixmap(dpi=72)
-            for plan in vector_plans:
+        # 1) precise text removal - redact original vector text spans
+        bg_pix = page.get_pixmap(dpi=72)
+        for plan in page_plans:
+            if plan.container.original_spans:
                 span_rects = [fitz.Rect(s.rect) for s in plan.container.original_spans]
                 remove_text(page, span_rects, bg_pix, verbose=verbose)
-        
-        # if inpainting didn't happen (RASTER containers but no OpenCV), use bbox fallback
-        if raster_plans:
-            try:
-                import cv2
-            except ImportError:
-                cv2 = None
-
-            if cv2 is None:
-                for plan in raster_plans:
-                    rect = fitz.Rect(plan.container.bbox)
-                    page.add_redact_annot(_safe_rect(page, rect, pad=0.1))
 
         # this removes the original vector text content
         page.apply_redactions()
@@ -1490,6 +1435,14 @@ def translate_pdf_bytes_pipeline(
     extraction_time = time.perf_counter() - t0
     _vprint(verbose, f"[PIPELINE] Extracted {len(orig_containers)} containers in {extraction_time:.2f}s.")
 
+    # vector-only filter: discard containers with no matched PDF text spans:
+    # containers produced by DocInt OCR on scanned/image pages have empty original_spans - no real text layer to remove or overlay
+    n_before = len(orig_containers)
+    orig_containers = [c for c in orig_containers if c.original_spans]
+    n_dropped = n_before - len(orig_containers)
+    if n_dropped:
+        _vprint(verbose, f"[PIPELINE] Dropped {n_dropped} OCR-only (raster) containers — vector-only mode.")
+
     # stage 2: normalization & policy attribution
     containers_to_translate = []
     translate_idx_map = []
@@ -1659,7 +1612,6 @@ def translate_pdf_bytes_pipeline(
             doc,
             plans,
             target_lang=target_lang,
-            mask_regions_by_page=metadata.get("mask_regions_by_page"),
             verbose=verbose,
         )
         apply_time = time.perf_counter() - t2

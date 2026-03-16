@@ -2,10 +2,6 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Any, Optional
 
-class PageKind(str, Enum):
-    VECTOR = "VECTOR"
-    RASTER = "RASTER"
-    HYBRID = "HYBRID"
 
 class ContainerKind(str, Enum):
     TABLE_CELL = "TABLE_CELL"
@@ -26,9 +22,6 @@ class PdfSpanAttrs:
     ascender: float
     descender: float
 
-@dataclass
-class PdfMetadata:
-    page_routing: Dict[int, PageKind]
 
 @dataclass
 class ContainerRef:
