@@ -69,6 +69,12 @@ def apply_normalization_pipeline(text: str, start_counter: int = 0) -> Tuple[str
     
     return ph_text, NormalizationState(original_text=text, placeholders=placeholders), next_counter
 
+def repair_placeholders(text: str) -> str:
+    """Repair common malformed placeholder variants into canonical [[INLINE#]]."""
+    # matches [INLINE0], [[ INLINE 1 ]], 【INLINE 2】, [[inline 3]], etc.
+    pattern = r'[\[【]+\s*(?i:INLINE)[_\-\s]*(\d+)\s*[\]】]+'
+    return re.sub(pattern, r'[[INLINE\1]]', text)
+
 def restore_protected_tokens(translated_text: str, state: NormalizationState) -> str:
     restored = translated_text
     # restore placedholders

@@ -194,15 +194,18 @@ def _llm1_refine(
     paragraph_context: Optional[List[str]] = None, # sibling lines in same paragraph
 ) -> str:
     system_lines = [
-        f"You are a PROFESSIONAL TECHNICAL TRANSLATOR AND EDITOR for ({source_lang.upper()} -> {target_lang.upper()}).",
-        "Task: IMPROVE the provided machine translation so it is GRAMMATICALLY CORRECT, FLUENT, and FAITHFUL.",
+        f"You are an EXPERIENCED LANGUAGE TRANSLATOR AND EDITOR for ({source_lang.upper()} -> {target_lang.upper()}).",
+        f"Task: IMPROVE the provided machine translation so it is GRAMMATICALLY CORRECT, NATURAL, and FAITHFUL to the original content (also provided to you). The result must read as if translated by a skilled native professional in the {target_lang.upper()} language.",
         "STRICT RULES TO FOLLOW:",
-        " - ALWAYS PRESERVE the meaning of the original text EXACTLY.",
-        " - PROPER NOUNS: Company names, organization names, and geographic locations (e.g. Gurugram, India) MUST be translated or transcribed into the target language (e.g. using Katakana in Japanese) unless it's a globally recognized trademark where English is preferred (like Apple, Google). Do NOT leave them in English if they have a target language equivalent or can be transcribed.",
+        "- BE FAITHFUL TO SOURCE MEANING, NOT TO SOURCE WORDING.",
+        f" - ALWAYS PRESERVE the source meaning, intent, tone, and level of formality EXACTLY. However, DO NOT blindly use source-language ({source_lang.upper()}) wording, word order, or sentence structure when a MORE NATURAL target-language ({target_lang.upper()}) expression conveys the SAME MEANING.",
+        f"AVOID word-for-word translation and translationese (overly-literal translations from {source_lang.upper()} to {target_lang.upper()}). Your output should be NATURAL and FLUENT while also MAINTAINING THE MEANING AND NUANCE OF THE CONTENT.",
+        "DO NOT add, omit, soften, intensify, or reinterpret meaning of the original text.",
+        f" - PROPER NOUNS: For names, labels, and fixed expressions, prefer the form that sounds STANDARD and NATURAL in the target-language ({target_lang.upper()}) context. Do not mechanically transliterate or literally translate if a more established or contextually appropriate form is clearly indicated. Do NOT leave them in source-language ({source_lang.upper()}) if they have a target-language ({target_lang.upper()}) equivalent.",
         " - ALWAYS PRESERVE numbers, units, codes, part numbers, and tokens like '[[INLINE#]]' and '[[BLOCK#]]' EXACTLY.",
         " - ALWAYS PRESERVE tokens like '[L#]' and '[/L#]' which indicate line breaks in the original PDF. Do not add or remove them, and keep them in the same position relative to the text.",
         " - CRITICAL: DO NOT merge content between different '[L#]' tags. Every [L#] tag provided in the input MUST exist in the output with its corresponding line's content. Do not combine L5 and L6 into one block.",
-        " - NEVER add extra commentary or chat.",
+        " - NEVER add extra commentary, chat, or information. This includes any auto-completion of facts, prefatory remarks, explanations, apologies, or notes about the translation process. Provide ONLY the translation text as output.",
     ]
     
     # kind-aware specific instructions
@@ -217,7 +220,7 @@ def _llm1_refine(
         system_lines.append(" - CONTEXT: This is a short label inside a diagram or UI. Conciseness is CRITICAL.")
     if is_short_mode:
         print(f"Applying SHORT MODE instructions for source: '{_preview(source_text)}'")
-        system_lines.append(" - SHORT MODE ACTIVE: Perform a 'lossy' grammar compression: remove articles (the, a, is), use abbreviations, and provide the shortest valid translation variant that fits in tight space.")
+        system_lines.append(" - SHORT MODE ACTIVE: Prefer the shortest natural and professionally acceptable translation that fits tight space. Do not omit information that changes meaning, tone, role, or terminology. Avoid unnatural compression.")
     system_lines.append("STRICTLY ALWAYS PROVIDE OUTPUT JSON with key: translation")
     
     system = "\n".join(system_lines)
@@ -479,6 +482,7 @@ def translate_blocks(
         ctx: List[Dict[str, str]] = []
         start = max(0, i - 10)
         for j in range(start, i):
+            if j == start: _safe_print(f"Passing up to 10 previous chunks as context to LLM 1, beginning from #{j} - {_preview(src_texts[j])} -> {_preview(mt_out[j])}", verbose=eff_verbose)
             ctx.append({"src": src_texts[j], "mt": mt_out[j]})
 
         src = src_texts[i].strip()

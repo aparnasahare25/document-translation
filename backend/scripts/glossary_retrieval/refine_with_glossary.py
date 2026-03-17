@@ -506,7 +506,7 @@ def build_refinement_prompt(
         system_msg = get_no_placeholder_sys_prompt(source_lang, target_lang).strip()
 
     if is_short_mode:
-        system_msg += "\n\nCRITICAL: SHORT MODE ACTIVE. Deliver the shortest valid translation variant. Eliminate redundant words/articles."
+        system_msg += "\n\nCRITICAL: SHORT MODE ACTIVE. Deliver the shortest valid and natural translation variant."
 
     user_payload = {
         "source_en": english_chunk,

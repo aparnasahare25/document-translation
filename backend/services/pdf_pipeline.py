@@ -1302,6 +1302,11 @@ def _unmerge_paragraph_translations(
 
         # multi-line: parse delimiters
         raw = trans.translated_text
+        
+        # repair malformed line tags before parsing
+        raw = re.sub(r'\[\s*L\s*(\d+)\s*\]', r'[L\1]', raw, flags=re.IGNORECASE)
+        raw = re.sub(r'\[\s*/\s*L\s*(\d+)\s*\]', r'[/L\1]', raw, flags=re.IGNORECASE)
+        
         matches = _LINE_TAG_RE.findall(raw)
         parsed: Dict[int, str] = {} # 1-indexed line_num -> text
         for num_str, text in matches:
@@ -1321,7 +1326,7 @@ def _unmerge_paragraph_translations(
         else:
             # fallback: delimiters missing or corrupted
             # strip ANY remaining tags (even unpaired/malformed ones) before splitting to prevent [L5] etc. from leaking into the final text.
-            clean = re.sub(r"\[/?L\d+\]", "", raw).strip()
+            clean = re.sub(r"\[/?L\d+\]", "", raw, flags=re.IGNORECASE).strip()
             if not clean:
                 clean = raw # if stripping removed everything, keep raw
             
@@ -1333,16 +1338,24 @@ def _unmerge_paragraph_translations(
             total_src = sum(src_lengths) or 1
             trans_len = len(clean)
 
+            # identify spans that should not be split (e.g. [[INLINE0]])
+            protected_spans = [m.span() for m in re.finditer(r'\[\[.*?\]\]', clean)]
+            def safe_split_point(target: int) -> int:
+                for start, end in protected_spans:
+                    if start < target < end:
+                        return start if (target - start) <= (end - target) else end
+                return target
+
             offset = 0
             for line_idx, ci in enumerate(entry.original_indices):
-                proportion = src_lengths[line_idx] / total_src
-                chunk_len = int(round(proportion * trans_len))
-                # Last line gets the remainder to avoid off-by-one
                 if line_idx == len(entry.original_indices) - 1:
                     chunk = clean[offset:]
                 else:
-                    chunk = clean[offset:offset + chunk_len]
-                offset += chunk_len
+                    proportion = src_lengths[line_idx] / total_src
+                    target_offset = offset + int(round(proportion * trans_len))
+                    safe_offset = safe_split_point(target_offset)
+                    chunk = clean[offset:safe_offset]
+                    offset = safe_offset
 
                 expanded.append(ContainerTranslation(
                     container=original_containers[ci],
@@ -1527,12 +1540,24 @@ def translate_pdf_bytes_pipeline(
                 trans_idx += 1
             
             # final restoration of placeholders
-            # use aggregated placeholders for the group so placeholders migrated by LLM are still restored
-            combined_placeholders = group_all_placeholders.get(gid, norm_state.placeholders)
-            # create a shallow state for restoration that covers the whole paragraph group
-            restoration_state = NormalizationState(original_text=norm_state.original_text, placeholders=combined_placeholders)
+            from scripts.text_normalization.normalizer import repair_placeholders
             
-            final_txt = restore_protected_tokens(trans_text, restoration_state)
+            # 1) repair malformed placeholders from LLM
+            trans_text_repaired = repair_placeholders(trans_text)
+            
+            # 2) prefer line-local restoration first
+            final_txt = restore_protected_tokens(trans_text_repaired, norm_state)
+            
+            # 3) group-wide fallback for migrating placeholders
+            if "[[" in final_txt:
+                combined_placeholders = group_all_placeholders.get(gid, {})
+                group_state = NormalizationState(original_text=norm_state.original_text, placeholders=combined_placeholders)
+                final_txt = restore_protected_tokens(final_txt, group_state)
+                
+            # 4) fail harder if broken placeholders remain
+            if re.search(r'\[\[?INLINE\d+\]\]?', final_txt, re.IGNORECASE):
+                _vprint(verbose, f"[PIPELINE] Broken placeholder detected in translation. Falling back to source text for: {c.text}")
+                final_txt = c.text
             
             # build rendering intent
             intent = RenderingIntent(
