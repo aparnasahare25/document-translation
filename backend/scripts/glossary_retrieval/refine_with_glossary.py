@@ -378,7 +378,7 @@ def search_paragraphs_by_vector(
 
 
 def retrieve_glossary_paragraphs(
-    english_chunk: str,
+    source_chunk: str,
     current_translation: str,
     verbose: bool,
     top_k: int = 5,
@@ -386,8 +386,8 @@ def retrieve_glossary_paragraphs(
     lang: Optional[str] = None,
 ) -> List[Dict]:
     """
-    Dual retrieval (embeds EN + current translation together in ONE call):
-        - Query 1: English original chunk
+    Dual retrieval (embeds SOURCE + current translation together in ONE call):
+        - Query 1: Source original chunk
         - Query 2: current target-language translation
 
     Scoped only by lang:
@@ -397,36 +397,36 @@ def retrieve_glossary_paragraphs(
     if verbose:
         _step("RETRIEVING GLOSSARY PARAGRAPHS")
 
-    en_q = (english_chunk or "").strip()
+    src_q = (source_chunk or "").strip()
     tl_q = (current_translation or "").strip()
 
     lang_eff = lang if (lang is not None) else (RAG_LANG_DEFAULT or None)
 
-    if en_q and tl_q:
+    if src_q and tl_q:
         if verbose:
-            print("\n[INFO] Embedding both EN + target queries in one batch call.\n")
-        vec_en, vec_tl = embed_many([en_q, tl_q], verbose)
-        hits_en = search_paragraphs_by_vector(vec_en, verbose, top_k=top_k, lang=lang_eff)
+            print("\n[INFO] Embedding both SOURCE + target queries in one batch call.\n")
+        vec_src, vec_tl = embed_many([src_q, tl_q], verbose)
+        hits_src = search_paragraphs_by_vector(vec_src, verbose, top_k=top_k, lang=lang_eff)
         hits_tl = search_paragraphs_by_vector(vec_tl, verbose, top_k=top_k, lang=lang_eff)
-    elif en_q:
+    elif src_q:
         if verbose:
-            print("\n[INFO] Embedding only EN query.\n")
-        vec_en = embed_many([en_q], verbose)[0]
-        hits_en = search_paragraphs_by_vector(vec_en, verbose, top_k=top_k, lang=lang_eff)
+            print("\n[INFO] Embedding only SOURCE query.\n")
+        vec_src = embed_many([src_q], verbose)[0]
+        hits_src = search_paragraphs_by_vector(vec_src, verbose, top_k=top_k, lang=lang_eff)
         hits_tl = []
     elif tl_q:
         if verbose:
             print("\n[INFO] Embedding only target query.\n")
         vec_tl = embed_many([tl_q], verbose)[0]
-        hits_en = []
+        hits_src = []
         hits_tl = search_paragraphs_by_vector(vec_tl, verbose, top_k=top_k, lang=lang_eff)
     else:
         if verbose:
-            print("\n[INFO] No valid EN or target query provided; skipping retrieval.\n")
-        hits_en, hits_tl = [], []
+            print("\n[INFO] No valid SOURCE or target query provided; skipping retrieval.\n")
+        hits_src, hits_tl = [], []
 
     merged: Dict[str, Dict] = {}
-    for hit in hits_en + hits_tl:
+    for hit in hits_src + hits_tl:
         cur = merged.get(hit["id"])
         if cur is None or hit["score"] > cur["score"]:
             merged[hit["id"]] = hit
@@ -479,7 +479,7 @@ def call_llm_json(system_msg: str, user_payload: dict, verbose: bool) -> dict:
 
 
 def build_refinement_prompt(
-    english_chunk: str,
+    source_chunk: str,
     current_translation: str,
     glossary_paragraphs: List[Dict],
     is_placeholder: bool,
@@ -491,7 +491,7 @@ def build_refinement_prompt(
 ) -> Dict[str, Any]:
     """
     LLM sees:
-        - English source
+        - Source text
         - current target-language translation
         - retrieved target-language glossary/context paragraphs
         - glossary
@@ -509,7 +509,7 @@ def build_refinement_prompt(
         system_msg += "\n\nCRITICAL: SHORT MODE ACTIVE. Deliver the shortest valid and natural translation variant."
 
     user_payload = {
-        "source_en": english_chunk,
+        "source": source_chunk,
         "current_translation": current_translation,
         "glossary_context_paragraphs": [
             {"id": p.get("id", ""), "content": p.get("content", "")} for p in glossary_paragraphs
@@ -530,7 +530,7 @@ def build_refinement_prompt(
 # MAIN API
 # -----------------------------------------------------------------------------
 def refine_segment_with_glossary(
-    english_chunk: str,
+    source_chunk: str,
     current_translation: str,
     is_placeholder: bool,
     verbose: bool,
@@ -545,7 +545,7 @@ def refine_segment_with_glossary(
     Main API:
 
     Inputs:
-        - english_chunk       : original English text
+        - source_chunk        : original source text
         - current_translation : existing target-language translation (MT + LLM1 refined)
 
     Output:
@@ -557,7 +557,7 @@ def refine_segment_with_glossary(
     """
     if verbose:
         _step("REFINING SINGLE SEGMENT")
-        _print_kv("English Preview", _preview(english_chunk, 250))
+        _print_kv("Source Preview", _preview(source_chunk, 250))
         _print_kv("Current Translation Preview", _preview(current_translation, 250))
 
     lang_eff = None
@@ -572,7 +572,7 @@ def refine_segment_with_glossary(
         _print_kv("target_lang (requested)", str(target_lang or "(none)"))
 
     glossary_paragraphs = retrieve_glossary_paragraphs(
-        english_chunk=english_chunk,
+        source_chunk=source_chunk,
         current_translation=current_translation,
         verbose=verbose,
         top_k=top_k_paragraphs,
@@ -580,7 +580,7 @@ def refine_segment_with_glossary(
     )
 
     prompt = build_refinement_prompt(
-        english_chunk,
+        source_chunk,
         current_translation,
         glossary_paragraphs,
         is_placeholder,

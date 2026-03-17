@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
+from scripts.llm1_prompts import build_llm1_refinement_prompt
 from scripts.glossary_retrieval.refine_with_glossary import refine_segment_with_glossary
 
 load_dotenv()
@@ -132,30 +133,17 @@ def _llm1_refine(
     is_short_mode: bool = False,
 ) -> str:
     """Ask Azure OpenAI to improve the MT output for one text run."""
-    system_lines = [
-        f"You are a professional technical translator and editor ({source_lang.upper()} -> {target_lang.upper()}).",
-        "Task: Improve the provided machine translation so it is grammatically correct, fluent, and faithful.",
-        "Rules:",
-        " - Preserve meaning exactly.",
-        " - Preserve numbers, units, codes, part numbers, and tokens like [[...]] exactly.",
-        " - Do not add extra commentary or chat.",
-    ]
-    if is_short_mode:
-        system_lines.append(
-            " - SHORT MODE ACTIVE: Perform 'lossy' grammar compression: remove articles (the, a, is),"
-            " use abbreviations, and provide the shortest valid translation variant."
-        )
-    system_lines.append("Output JSON with key: translation")
-    system = "\n".join(system_lines)
-
-    payload = {
-        "source_lang": source_lang,
-        "target_lang": target_lang,
-        "previous_context": context_prev_10,
-        "source": source_text,
-        "machine_translation": mt_text,
-        "instructions": "Return only JSON.",
-    }
+    prompt_data = build_llm1_refinement_prompt(
+        source_text=source_text,
+        mt_text=mt_text,
+        context_prev_10=context_prev_10,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        is_short_mode=is_short_mode
+    )
+    
+    system = prompt_data["system"]
+    payload = prompt_data["user_payload"]
 
     cand = mt_text
     max_retries = 3 if is_placeholder else 2
