@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dotenv import load_dotenv
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 import os, fitz, io, re, threading, time, inspect, math # PyMuPDF (used for writing back into the PDF)
 
@@ -9,28 +10,14 @@ import os, fitz, io, re, threading, time, inspect, math # PyMuPDF (used for writ
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 
-from scripts.layout.extractor import build_containers
-from scripts.translation_service_pdf import translate_blocks
-from scripts.layout.typesetter import typeset_and_insert
-from scripts.layout.classifier import classify_container
-from scripts.layout.containers import (
-    ContainerRef,
-    ContainerKind,
-    TranslationPlan,
-    RenderingIntent,
-    TranslationPolicy,
-    ContainerTranslation,
-)
-from scripts.layout.geometry import (
-    poly_to_bbox as _poly_to_bbox,
-    scale_bbox as _scale_bbox,
-    scale_poly as _scale_poly,
-    union_bbox as _union_bbox,
-    bbox_overlap_area as _bbox_overlap_area,
-    bbox_area as _bbox_area,
-)
-from scripts.text_normalization.normalizer import apply_normalization_pipeline, restore_protected_tokens
-from services.logger import get_logger
+from services.logger                        import get_logger
+from scripts.layout.extractor               import build_containers
+from scripts.translation_service_pdf        import translate_blocks
+from scripts.layout.typesetter              import typeset_and_insert
+from scripts.layout.classifier              import classify_container
+from scripts.text_normalization.normalizer  import apply_normalization_pipeline, restore_protected_tokens
+from scripts.layout.geometry                import poly_to_bbox as _poly_to_bbox, scale_bbox as _scale_bbox, union_bbox as _union_bbox
+from scripts.layout.containers              import ContainerRef, TranslationPlan, RenderingIntent, TranslationPolicy, ContainerTranslation
 
 
 # -----------------------------
@@ -988,38 +975,83 @@ def _finalize_pdf_fonts(doc: fitz.Document, *, verbose: bool = False) -> None:
         _vprint(verbose, f"[FONT] subset_fonts skipped: {e!r}")
 
 
-def remove_text(page: fitz.Page, rects: List[fitz.Rect], pix: fitz.Pixmap, verbose: bool = False):
+def remove_text(page: fitz.Page, rect_data: List[Tuple[fitz.Rect, List[Tuple[float, float, float]]]], pix: fitz.Pixmap, verbose: bool = False):
     """
     Removal strategy: text-only removal avoiding background nuke.
+        - Samples from an outer ring around each text rect, excluding the inner area.
+        - Quantizes colors and rejects forbidden colors (original text colors).
     Adds redaction annotations filled with the sampled background color of the region.
     When apply_redactions() runs, it removes original intersecting text/graphics
     and leaves behind a solid patch of background color.
     """
-    from collections import Counter
-    for r in rects:
-        # sample background color from the perimeter (+2px)
-        x0 = max(0, int(r.x0))
-        y0 = max(0, int(r.y0))
-        x1 = min(pix.width - 1, int(r.x1))
-        y1 = min(pix.height - 1, int(r.y1))
+    # tunable parameters for robust background sampling
+    ring = 0.25                 # initial outer ring distance from the rect border
+    quant_step = 12             # RGB quantization step (0-255) to group similar background shades
+    color_dist_thresh = 0.07    # max Euclidean distance (0.0-1.0) to reject colors too close to text
+    min_confidence = 0.98       # minimum frequency of the dominant quantized color to be accepted
+    max_ring = 3.0              # maximum expansion of the sampling ring before falling back to white
+
+    def color_dist(c1, c2):
+        return math.sqrt(sum((a - b)**2 for a, b in zip(c1, c2)))
+
+    for r, forbidden in rect_data:
+        bg_fill = (1.0, 1.0, 1.0) # default fallback: white
+        found_viable = False
         
-        colors = []
-        for x in range(x0, x1 + 1):
-            colors.append(pix.pixel(x, y0))
-            colors.append(pix.pixel(x, y1))
-        for y in range(y0, y1 + 1):
-            colors.append(pix.pixel(x0, y))
-            colors.append(pix.pixel(x1, y))
+        current_ring = ring
+        while current_ring <= max_ring:
+            # sample from outer ring
+            x0 = max(0, int(r.x0 - current_ring))
+            y0 = max(0, int(r.y0 - current_ring))
+            x1 = min(pix.width - 1, int(r.x1 + current_ring))
+            y1 = min(pix.height - 1, int(r.y1 + current_ring))
             
-        if not colors:
-            bg_fill = (1.0, 1.0, 1.0)
-        else:
-            mc = Counter(colors).most_common(1)[0][0]
-            if isinstance(mc, int):
-                bg_fill = (1.0, 1.0, 1.0)  # handle grayscale fallback
-            else:
-                bg_fill = (mc[0]/255.0, mc[1]/255.0, mc[2]/255.0)
+            samples = []
+            # horizontal ring segments
+            for x in range(x0, x1 + 1):
+                samples.append(pix.pixel(x, y0))
+                samples.append(pix.pixel(x, y1))
+            # vertical ring segments
+            for y in range(y0, y1 + 1):
+                samples.append(pix.pixel(x0, y))
+                samples.append(pix.pixel(x1, y))
+            
+            if not samples:
+                current_ring += 0.25
+                continue
+
+            viable_samples = []
+            for s in samples:
+                if isinstance(s, int): # grayscale
+                    rgb = (s/255.0, s/255.0, s/255.0)
+                else: # RGB 
+                    rgb = (s[0]/255.0, s[1]/255.0, s[2]/255.0)
                 
+                # filter out colors too close to any forbidden one
+                too_close = False
+                for f in forbidden:
+                    if color_dist(rgb, f) < color_dist_thresh:
+                        too_close = True
+                        if verbose: print(f"Rejected sample {rgb} due to proximity to forbidden color {f} (dist={color_dist(rgb, f):.3f})")
+                        break
+                
+                if not too_close:
+                    # quantize
+                    q = tuple((int(c * 255) // quant_step) * quant_step for c in rgb)
+                    viable_samples.append(q)
+            
+            if viable_samples:
+                best_q, count = Counter(viable_samples).most_common(1)[0]
+                confidence = count / len(viable_samples)
+                if verbose: print(f"Ring {current_ring:.2f}: best_q={best_q}, count={count}, total={len(viable_samples)}, confidence={confidence:.2f}")
+                
+                if confidence >= min_confidence:
+                    bg_fill = (best_q[0]/255.0, best_q[1]/255.0, best_q[2]/255.0)
+                    found_viable = True
+                    break
+            
+            current_ring += 0.25 # widen the search if no clear background found
+            
         page.add_redact_annot(r, fill=bg_fill)
 
 
@@ -1078,10 +1110,17 @@ def apply_translations(
 
         # 1) precise text removal - redact original vector text spans
         bg_pix = page.get_pixmap(dpi=72)
+        
+        # bundle rects with their forbidden (original text) colors for better removal
+        redaction_bundles = []
         for plan in page_plans:
             if plan.container.original_spans:
-                span_rects = [fitz.Rect(s.rect) for s in plan.container.original_spans]
-                remove_text(page, span_rects, bg_pix, verbose=verbose)
+                forbidden = [_int_to_rgb(s.color) for s in plan.container.original_spans]
+                for s in plan.container.original_spans:
+                    redaction_bundles.append((fitz.Rect(s.rect), forbidden))
+                    
+        if redaction_bundles:
+            remove_text(page, redaction_bundles, bg_pix, verbose=verbose)
 
         # this removes the original vector text content
         page.apply_redactions()

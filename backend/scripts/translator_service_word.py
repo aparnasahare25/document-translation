@@ -405,7 +405,7 @@ class TranslatorService:
 
             try:
                 refined = refine_segment_with_glossary(
-                    english_chunk=src,
+                    source_chunk=src,
                     current_translation=cur,
                     is_placeholder=is_placeholder,
                     verbose=False,

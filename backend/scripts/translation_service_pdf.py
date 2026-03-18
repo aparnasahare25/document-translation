@@ -568,7 +568,7 @@ def translate_blocks(
         # OPTIONAL: can use prev 10 pass1 chunks as extra context inside your refine function
         try:
             res = refine_segment_with_glossary(
-                english_chunk=src,
+                source_chunk=src,
                 current_translation=cur,
                 is_placeholder=is_placeholder,
                 verbose=eff_verbose, # use effective verbose, not env-only VERBOSE
