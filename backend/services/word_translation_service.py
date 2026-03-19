@@ -8,6 +8,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from docx import Document
 from docx.oxml.ns import qn
 from docx.shared import Pt
+from docx.text.run import Run
+from docx.text.paragraph import Paragraph
 from scripts.translator_service_word import TranslatorService
 
 
@@ -23,28 +25,30 @@ class DocxFormatter:
             "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
         }
 
-    # ------------------------------------------------------------------
-    # Helper: detect if a run is inside a hyperlink element
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _is_hyperlink_run(run) -> bool:
-        """
-        Returns True if the run lives inside a <w:hyperlink> element.
-        Hyperlink runs contain the visible link text (URL label), which
-        should NOT be translated so links remain functional.
-        """
-        parent = run._element.getparent()
-        return parent is not None and parent.tag == qn("w:hyperlink")
+    # # ------------------------------------------------------------------
+    # # Helper: detect if a run is inside a hyperlink element
+    # # ------------------------------------------------------------------
+    # @staticmethod
+    # def _is_hyperlink_run(run) -> bool:
+    #     """
+    #     Returns True if the run lives inside a <w:hyperlink> element.
+    #     Hyperlink runs contain the visible link text (URL label), which
+    #     should NOT be translated so links remain functional.
+    #     """
+    #     parent = run._element.getparent()
+    #     return parent is not None and parent.tag == qn("w:hyperlink")
 
     # ------------------------------------------------------------------
     # Helper: collect translatable runs from a paragraph
     # ------------------------------------------------------------------
     def _collect_paragraph_runs(self, paragraph, run_refs: list, texts: list):
         """Append (run, text) pairs from a paragraph to the shared lists.
-        Runs that are part of a hyperlink are intentionally skipped.
+        We use xpath('.//w:r') to capture ALL runs, including those nested 
+        inside <w:hyperlink> elements, which paragraph.runs ignores.
         """
-        for run in paragraph.runs:
-            if run.text.strip() and not self._is_hyperlink_run(run):
+        for r_elem in paragraph._element.xpath('.//w:r'):
+            run = Run(r_elem, paragraph)
+            if run.text.strip():
                 run_refs.append(run)
                 texts.append(run.text)
 
@@ -63,7 +67,8 @@ class DocxFormatter:
         - Font-size enforcement is kept commented out; uncomment if needed.
         """
         original_alignment = paragraph.alignment
-        for run in paragraph.runs:
+        for r_elem in paragraph._element.xpath('.//w:r'):
+            run = Run(r_elem, paragraph)
             # Character spacing: set to normal (0 = no extra spacing)
             try:
                 if run.font is not None and run.font._element is not None:
@@ -99,65 +104,43 @@ class DocxFormatter:
             run_refs – list of live run objects (references into the doc)
             texts    – list of their current text strings (same order)
 
-        Covers: body paragraphs, tables, inline shapes (textboxes/charts),
-                section headers & footers.
+        Covers: ALL body paragraphs (including tables/shapes/SDTs) and headers/footers.
         """
         run_refs: list = []
         texts:    list = []
 
-        # Body paragraphs
-        for paragraph in doc.paragraphs:
-            self._collect_paragraph_runs(paragraph, run_refs, texts)
+        # We track seen parts (instead of ephemeral paragraph nodes) to correctly 
+        # avoid processing linked headers/footers multiple times without id() collisions.
+        seen_parts = []
 
-        # Tables
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for paragraph in cell.paragraphs:
-                        self._collect_paragraph_runs(paragraph, run_refs, texts)
-
-        # Inline shapes: textboxes
-        for shape in doc.inline_shapes:
-            if hasattr(shape, "text_frame") and shape.text_frame:
-                for paragraph in shape.text_frame.paragraphs:
-                    self._collect_paragraph_runs(paragraph, run_refs, texts)
-            # Charts (InlineShape doesn't have has_chart; check via element type)
-            if hasattr(shape, "has_chart") and shape.has_chart:
-                chart = shape.chart
-                if chart.has_title and chart.chart_title.text_frame:
-                    for paragraph in chart.chart_title.text_frame.paragraphs:
-                        self._collect_paragraph_runs(paragraph, run_refs, texts)
-                for axis in (chart.category_axis, chart.value_axis):
-                    if axis and axis.has_title and axis.axis_title.text_frame:
-                        for paragraph in axis.axis_title.text_frame.paragraphs:
-                            self._collect_paragraph_runs(paragraph, run_refs, texts)
-
-        # Headers and footers
-        # We collect from ALL sections (including linked ones) because footer
-        # text (e.g. "Page", "Confidential") should be translated even when
-        # the footer is shared across sections.  We use a seen-id set to avoid
-        # visiting the exact same paragraph object twice.
-        seen_paragraph_ids: set = set()
-
-        def _collect_hf_paragraphs(part):
-            if part is None:
+        def _process_part_paragraphs(part_element, parent_obj):
+            if part_element is None:
                 return
-            for paragraph in part.paragraphs:
-                pid = id(paragraph._element)
-                if pid not in seen_paragraph_ids:
-                    seen_paragraph_ids.add(pid)
-                    self._collect_paragraph_runs(paragraph, run_refs, texts)
+            if any(part_element is p for p in seen_parts):
+                return
+            seen_parts.append(part_element)
 
+            for p_elem in part_element.xpath('.//w:p'):
+                paragraph = Paragraph(p_elem, parent_obj)
+                self._collect_paragraph_runs(paragraph, run_refs, texts)
+
+        # 1. Main Document Body
+        _process_part_paragraphs(doc._element.body, doc._body)
+
+        # 2. Headers and footers
         for section in doc.sections:
-            # Default (odd-page) header & footer
-            _collect_hf_paragraphs(section.header)
-            _collect_hf_paragraphs(section.footer)
-            # First-page header & footer (used when "Different First Page" is enabled)
-            _collect_hf_paragraphs(section.first_page_header)
-            _collect_hf_paragraphs(section.first_page_footer)
-            # Even-page header & footer (used when "Different Odd & Even Pages" is enabled)
-            _collect_hf_paragraphs(section.even_page_header)
-            _collect_hf_paragraphs(section.even_page_footer)
+            if section.header is not None:
+                _process_part_paragraphs(section.header._element, section.header)
+            if section.footer is not None:
+                _process_part_paragraphs(section.footer._element, section.footer)
+            if section.first_page_header is not None:
+                _process_part_paragraphs(section.first_page_header._element, section.first_page_header)
+            if section.first_page_footer is not None:
+                _process_part_paragraphs(section.first_page_footer._element, section.first_page_footer)
+            if section.even_page_header is not None:
+                _process_part_paragraphs(section.even_page_header._element, section.even_page_header)
+            if section.even_page_footer is not None:
+                _process_part_paragraphs(section.even_page_footer._element, section.even_page_footer)
 
         return run_refs, texts
 
@@ -169,49 +152,46 @@ class DocxFormatter:
         Walk the document again and apply structural formatting (spacing,
         alignment, table wrap) AFTER translations have been written back.
         """
-        # Body paragraphs
-        for paragraph in doc.paragraphs:
-            self._format_paragraph_structure(paragraph)
-
-        # Tables: fix cell wrapping + paragraph formatting
+        # 1. Tables: fix cell wrapping ONLY
         for table in doc.tables:
             table.autofit = False
             table.allow_autofit = False
             for row in table.rows:
                 for cell in row.cells:
                     self._ensure_text_wrap(cell)
-                    for paragraph in cell.paragraphs:
-                        self._format_paragraph_structure(paragraph)
 
-        # Inline shapes
-        for shape in doc.inline_shapes:
-            if hasattr(shape, "text_frame") and shape.text_frame:
-                for paragraph in shape.text_frame.paragraphs:
-                    self._format_paragraph_structure(paragraph)
+        # 2. Apply paragraph formatting across ALL paragraphs
+        seen_fmt_parts = []
 
-        # Headers and footers (skip font enforcement; avoid double-formatting
-        # by tracking seen paragraph element ids)
-        seen_fmt_ids: set = set()
-
-        def _fmt_hf_paragraphs(part):
-            if part is None:
+        def _fmt_part_paragraphs(part_element, parent_obj, skip_font_enforcement=False):
+            if part_element is None:
                 return
-            for paragraph in part.paragraphs:
-                pid = id(paragraph._element)
-                if pid not in seen_fmt_ids:
-                    seen_fmt_ids.add(pid)
-                    self._format_paragraph_structure(paragraph, skip_font_enforcement=True)
+            if any(part_element is p for p in seen_fmt_parts):
+                return
+            seen_fmt_parts.append(part_element)
 
+            from docx.text.paragraph import Paragraph
+            for p_elem in part_element.xpath('.//w:p'):
+                paragraph = Paragraph(p_elem, parent_obj)
+                self._format_paragraph_structure(paragraph, skip_font_enforcement=skip_font_enforcement)
+
+        # Main Document Body
+        _fmt_part_paragraphs(doc._element.body, doc._body)
+
+        # Headers and Footers
         for section in doc.sections:
-            # Default (odd-page) header & footer
-            _fmt_hf_paragraphs(section.header)
-            _fmt_hf_paragraphs(section.footer)
-            # First-page header & footer
-            _fmt_hf_paragraphs(section.first_page_header)
-            _fmt_hf_paragraphs(section.first_page_footer)
-            # Even-page header & footer
-            _fmt_hf_paragraphs(section.even_page_header)
-            _fmt_hf_paragraphs(section.even_page_footer)
+            if section.header is not None:
+                _fmt_part_paragraphs(section.header._element, section.header, skip_font_enforcement=True)
+            if section.footer is not None:
+                _fmt_part_paragraphs(section.footer._element, section.footer, skip_font_enforcement=True)
+            if section.first_page_header is not None:
+                _fmt_part_paragraphs(section.first_page_header._element, section.first_page_header, skip_font_enforcement=True)
+            if section.first_page_footer is not None:
+                _fmt_part_paragraphs(section.first_page_footer._element, section.first_page_footer, skip_font_enforcement=True)
+            if section.even_page_header is not None:
+                _fmt_part_paragraphs(section.even_page_header._element, section.even_page_header, skip_font_enforcement=True)
+            if section.even_page_footer is not None:
+                _fmt_part_paragraphs(section.even_page_footer._element, section.even_page_footer, skip_font_enforcement=True)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -284,7 +264,7 @@ class DocxFormatter:
 if __name__ == "__main__":
     from_lang = "en"
     to_lang = "ja"
-    input_doc_path = r"C:\gen_ai\document-translation\backend\data\word file\Employee_Handbook_NovaTech - Copy.docx"
+    input_doc_path = r"C:\gen_ai\document-translation\backend\data\word file\IT_Security_Policy_Manual.docx"
     file_extension = os.path.splitext(input_doc_path)[1]
     input_doc_name = os.path.splitext(os.path.basename(input_doc_path))[0]
     output_doc_path = f"{input_doc_name}_{from_lang}_{to_lang}{file_extension}"
