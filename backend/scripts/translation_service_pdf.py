@@ -65,6 +65,31 @@ def _should_skip_translation(text: str) -> bool:
     return False
 
 
+def _looks_like_wrapped_translatable_text(s: str) -> bool:
+    s = (s or "").strip()
+    if not s or len(s) < 3:
+        return False
+
+    pairs = [
+        ("<", ">"),
+        ("【", "】"),
+        ("[", "]"),
+        ("（", "）"),
+        ("(", ")"),
+        ("「", "」"),
+        ("『", "』"),
+    ]
+
+    for left, right in pairs:
+        if s.startswith(left) and s.endswith(right):
+            inner = s[len(left):-len(right)].strip()
+            if not inner: return False # empty
+            if re.fullmatch(r"[\W\d_]+", inner, flags=re.UNICODE): return False # non-linguistic
+            if _has_alpha(inner): return True # contains some letters, likely worth translating
+
+    return False
+
+
 def _extract_placeholders(s: str) -> List[str]:
     return _PLACEHOLDER_RE.findall(s or "")
 
@@ -344,6 +369,9 @@ def translate_blocks(
     # -------------------------
     # stage 1: MT (batched + threaded)
     # -------------------------
+    mt_debug_by_index: Dict[int, Dict[str, Any]] = {}
+    mt_debug_lock = threading.Lock()
+
     mt_out: List[str] = list(src_texts)
 
     # create batches of indices we actually translate
@@ -407,10 +435,24 @@ def translate_blocks(
     for i in range(n):
         if skip_mask[i]:
             mt_out[i] = src_texts[i]
-        else:
-            if not mt_out[i] or mt_out[i].strip() == "" or mt_out[i] == src_texts[i]:
-                mt_out[i] = src_texts[i]
-                mt_identity_or_empty += 1
+            continue
+
+        raw_mt = mt_out[i]
+        noop_reason = None
+
+        if raw_mt is None or raw_mt.strip() == "":
+            mt_out[i] = src_texts[i]
+            mt_identity_or_empty += 1
+            noop_reason = "MT returned empty text"
+        elif raw_mt == src_texts[i]:
+            mt_out[i] = src_texts[i]
+            mt_identity_or_empty += 1
+            noop_reason = "MT returned unchanged text"
+        else: mt_out[i] = raw_mt
+
+        with mt_debug_lock:
+            mt_debug_by_index[i] = {"index": i, "original": src_texts[i], "mt": mt_out[i], "noop_reason": noop_reason}
+
     counts["mt_identity_or_empty_fallbacks"] = mt_identity_or_empty
 
     _safe_print(
@@ -433,10 +475,10 @@ def translate_blocks(
             group_map.setdefault(gid, []).append(i)
 
     # store per-index info to create deterministic "1 in 5" samples later.
-    llm1_debug_by_index: Dict[int, Dict[str, str]] = {}
+    llm1_debug_by_index: Dict[int, Dict[str, Any]] = {}
     llm1_debug_lock = threading.Lock()
 
-    llm2_debug_by_index: Dict[int, Dict[str, str]] = {}
+    llm2_debug_by_index: Dict[int, Dict[str, Any]] = {}
     llm2_debug_lock = threading.Lock()
 
     def llm1_task(i: int) -> Tuple[int, str, float]:
@@ -499,12 +541,38 @@ def translate_blocks(
             _safe_print(f"[LLM1] failed at i={i}: {e} -> fallback to MT", verbose=eff_verbose)
             return i, mt_out[i], (time.perf_counter() - t0)
 
-    llm1_indices = [i for i in range(n) if not skip_mask[i] and mt_out[i] != src_texts[i]]
+    llm1_indices = []
+    for i in range(n):
+        if skip_mask[i]:
+            continue
+
+        src = (src_texts[i] or "").strip()
+        mt = (mt_out[i] or "").strip()
+
+        should_run_llm1 = (
+            mt != src
+            or _looks_like_wrapped_translatable_text(src)
+        )
+
+        if should_run_llm1:
+            llm1_indices.append(i)
+        else:
+            with llm1_debug_lock:
+                existing = llm1_debug_by_index.get(i, {})
+                llm1_debug_by_index[i] = {
+                    **existing,
+                    "index": i,
+                    "original": src_texts[i],
+                    "mt": mt_out[i],
+                    "translated": src_texts[i],
+                    "noop_reason": "LLM-1 skipped because MT output == source and text was not a wrapped translatable label",
+                }
+
     counts["llm1_candidates"] = len(llm1_indices)
 
     _safe_print(
         f"[TRANSLATE][STAGE2-LLM1] candidates={len(llm1_indices)}, skipped_heuristic={skip_count}, "
-        f"skipped_no_mt_change={len(todo_indices) - len(llm1_indices)}",
+        f"skipped_after_mt_gate={len(todo_indices) - len(llm1_indices)}",
         verbose=eff_verbose,
     )
 
@@ -523,10 +591,14 @@ def translate_blocks(
 
                 # keep deterministic sample data by source index
                 with llm1_debug_lock:
+                    prev = llm1_debug_by_index.get(i, {})
                     llm1_debug_by_index[i] = {
+                        **prev,
+                        "index": i,
                         "original": src_texts[i],
                         "translated": out_t,
                         "mt": mt_out[i],
+                        "noop_reason": prev.get("noop_reason"),
                     }
 
                 if eff_verbose and (done_idx % log_every_n == 0):
@@ -591,7 +663,17 @@ def translate_blocks(
             _safe_print(f"[LLM2] failed at i={i}: {e} -> keep LLM1", verbose=eff_verbose)
             return i, cur, (time.perf_counter() - t0), ""
 
-    llm2_indices = [i for i in range(n) if not skip_mask[i] and pass1[i] != src_texts[i]]
+    llm2_indices = []
+    for i in range(n):
+        if skip_mask[i]: continue
+
+        if pass1[i] != src_texts[i]: llm2_indices.append(i)
+        else:
+            with llm2_debug_lock:
+                existing = llm2_debug_by_index.get(i, {})
+                llm2_debug_by_index[i] = {**existing, "index": i, "original": src_texts[i],\
+                    "translated": pass1[i], "glossary_hit": "","noop_reason": "LLM-2 skipped because LLM-1 output == source"}
+
     counts["llm2_candidates"] = len(llm2_indices)
 
     _safe_print(
@@ -614,10 +696,14 @@ def translate_blocks(
                     per_chunk_total[i] += elapsed
 
                 with llm2_debug_lock:
+                    prev = llm2_debug_by_index.get(i, {})
                     llm2_debug_by_index[i] = {
+                        **prev,
+                        "index": i,
                         "original": src_texts[i],
                         "translated": out_t,
-                        "glossary_hit": top_hit
+                        "glossary_hit": top_hit,
+                        "noop_reason": prev.get("noop_reason"),
                     }
 
                 if eff_verbose and (done_idx % log_every_n == 0):
@@ -644,7 +730,18 @@ def translate_blocks(
     for i, b in enumerate(blocks):
         out.append(ContainerTranslation(container=b, translated_text=final_out[i]))
 
-    # deterministic LLM1 sample list in original order (wrapper will print 1 in 5)
+    # deterministic MT sample list
+    mt_pairs: List[Dict[str, Any]] = []
+    for i in sorted(mt_debug_by_index.keys()):
+        row = mt_debug_by_index[i]
+        mt_pairs.append({
+            "index": i,
+            "original": row.get("original", ""),
+            "mt": row.get("mt", ""),
+            "noop_reason": row.get("noop_reason", ""),
+        })
+
+    # deterministic LLM1 sample list
     llm1_pairs: List[Dict[str, Any]] = []
     for i in sorted(llm1_debug_by_index.keys()):
         row = llm1_debug_by_index[i]
@@ -653,6 +750,7 @@ def translate_blocks(
             "original": row.get("original", ""),
             "translated": row.get("translated", ""),
             "mt": row.get("mt", ""),
+            "noop_reason": row.get("noop_reason", ""),
         })
 
     # deterministic LLM2 sample list
@@ -664,6 +762,7 @@ def translate_blocks(
             "original": row.get("original", ""),
             "translated": row.get("translated", ""),
             "glossary_hit": row.get("glossary_hit", ""),
+            "noop_reason": row.get("noop_reason", ""),
         })
 
     diagnostics: Dict[str, Any] = {
@@ -691,7 +790,7 @@ def translate_blocks(
             "stage2_llm1": {
                 "candidates": counts["llm1_candidates"],
                 "skipped_heuristic": skip_count,
-                "skipped_no_mt_change": len(todo_indices) - len(llm1_indices),
+                "skipped_after_mt_gate": len(todo_indices) - len(llm1_indices),
                 "failures": counts["llm1_failures"],
             },
             "stage3_llm2": {
@@ -702,9 +801,11 @@ def translate_blocks(
             },
         },
         # samples for pdf pipeline log printer
+        "mt_pairs": mt_pairs,
         "llm1_pairs": llm1_pairs,
         "llm2_pairs": llm2_pairs,
         "samples": {
+            "mt_pairs": mt_pairs,
             "llm1_pairs": llm1_pairs,
             "llm2_pairs": llm2_pairs,
         },

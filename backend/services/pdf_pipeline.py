@@ -987,9 +987,9 @@ def remove_text(page: fitz.Page, rect_data: List[Tuple[fitz.Rect, List[Tuple[flo
     # tunable parameters for robust background sampling
     ring = 0.25                 # initial outer ring distance from the rect border
     quant_step = 12             # RGB quantization step (0-255) to group similar background shades
-    color_dist_thresh = 0.07    # max Euclidean distance (0.0-1.0) to reject colors too close to text
+    color_dist_thresh = 0.20    # max Euclidean distance (0.0-1.0) to reject colors too close to text
     min_confidence = 0.98       # minimum frequency of the dominant quantized color to be accepted
-    max_ring = 3.0              # maximum expansion of the sampling ring before falling back to white
+    max_ring = 4.0              # maximum expansion of the sampling ring before falling back to white
 
     def color_dist(c1, c2):
         return math.sqrt(sum((a - b)**2 for a, b in zip(c1, c2)))
@@ -1625,6 +1625,7 @@ def translate_pdf_bytes_pipeline(
                 orig_to_merged[orig_idx] = midx
 
         # merged_idx -> debug_info
+        mt_map   = {p["index"]: p for p in diagnostics.get("mt_pairs", [])}
         llm1_map = {p["index"]: p for p in diagnostics.get("llm1_pairs", [])}
         llm2_map = {p["index"]: p for p in diagnostics.get("llm2_pairs", [])}
 
@@ -1646,15 +1647,22 @@ def translate_pdf_bytes_pipeline(
                 llm2_text = ""
                 gloss_hit = ""
                 
+                noop_reasons = []
+
                 if midx is not None:
-                    # delimited versions from diagnostics
+                    d0 = mt_map.get(midx, {})
                     d1 = llm1_map.get(midx, {})
                     d2 = llm2_map.get(midx, {})
-                    merged_src = d1.get("original") or d2.get("original") or ""
-                    mt_text = d1.get("mt", "")
+
+                    merged_src = (d0.get("original") or d1.get("original") or d2.get("original") or "")
+
+                    mt_text = d0.get("mt", "") or d1.get("mt", "")
                     llm1_text = d1.get("translated", "")
                     llm2_text = d2.get("translated", "")
                     gloss_hit = d2.get("glossary_hit", "")
+
+                    for reason in (d0.get("noop_reason"), d1.get("noop_reason"), d2.get("noop_reason")):
+                        if reason and reason not in noop_reasons: noop_reasons.append(reason)
 
                 logger.log_entry(
                     source_text=c.text,
@@ -1664,7 +1672,8 @@ def translate_pdf_bytes_pipeline(
                     llm1_translation=llm1_text,
                     llm2_translation=llm2_text,
                     glossary_term=gloss_hit,
-                    final_text=plan.final_rendered_text
+                    final_text=plan.final_rendered_text,
+                    insights={"noop_reasons": " | ".join(noop_reasons)} if noop_reasons else None,
                 )
 
         _print_translation_samples(orig_containers, plans, diagnostics, verbose=verbose)
