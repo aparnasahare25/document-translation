@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
-import os, fitz, io, re, threading, time, inspect, math # PyMuPDF (used for writing back into the PDF)
+import os, fitz, io, re, threading, time, inspect, math, unicodedata # PyMuPDF (used for writing back into the PDF)
 
 # Azure Document Intelligence
 from azure.core.credentials import AzureKeyCredential
@@ -15,9 +15,9 @@ from scripts.layout.extractor               import build_containers
 from scripts.translation_service_pdf        import translate_blocks
 from scripts.layout.typesetter              import typeset_and_insert
 from scripts.layout.classifier              import classify_container
-from scripts.text_normalization.normalizer  import apply_normalization_pipeline, restore_protected_tokens
 from scripts.layout.geometry                import poly_to_bbox as _poly_to_bbox, scale_bbox as _scale_bbox, union_bbox as _union_bbox
 from scripts.layout.containers              import ContainerRef, TranslationPlan, RenderingIntent, TranslationPolicy, ContainerTranslation
+from scripts.text_normalization.normalizer  import apply_normalization_pipeline, restore_protected_tokens, NormalizationState, repair_placeholders
 
 
 # -----------------------------
@@ -1032,7 +1032,7 @@ def remove_text(page: fitz.Page, rect_data: List[Tuple[fitz.Rect, List[Tuple[flo
                 for f in forbidden:
                     if color_dist(rgb, f) < color_dist_thresh:
                         too_close = True
-                        if verbose: print(f"Rejected sample {rgb} due to proximity to forbidden color {f} (dist={color_dist(rgb, f):.3f})")
+                        # if verbose: print(f"Rejected sample {rgb} due to proximity to forbidden color {f} (dist={color_dist(rgb, f):.3f})")
                         break
                 
                 if not too_close:
@@ -1043,7 +1043,7 @@ def remove_text(page: fitz.Page, rect_data: List[Tuple[fitz.Rect, List[Tuple[flo
             if viable_samples:
                 best_q, count = Counter(viable_samples).most_common(1)[0]
                 confidence = count / len(viable_samples)
-                if verbose: print(f"Ring {current_ring:.2f}: best_q={best_q}, count={count}, total={len(viable_samples)}, confidence={confidence:.2f}")
+                # if verbose: print(f"Ring {current_ring:.2f}: best_q={best_q}, count={count}, total={len(viable_samples)}, confidence={confidence:.2f}")
                 
                 if confidence >= min_confidence:
                     bg_fill = (best_q[0]/255.0, best_q[1]/255.0, best_q[2]/255.0)
@@ -1353,8 +1353,12 @@ def _unmerge_paragraph_translations(
 
         n = entry.line_count
 
-        if len(parsed) == n and all(i in parsed for i in range(1, n + 1)):
-            # all delimiters found
+        has_all_keys = len(parsed) == n and all(i in parsed for i in range(1, n + 1))
+        # If the LLM dumped everything into one line tag and left others empty, fallback to proportional.
+        has_empty_lines = has_all_keys and any(not parsed[i] for i in range(1, n + 1))
+
+        if has_all_keys and not has_empty_lines:
+            # all delimiters found and none are empty
             for line_num, ci in enumerate(entry.original_indices, start=1):
                 expanded.append(ContainerTranslation(
                     container=original_containers[ci],
@@ -1362,6 +1366,85 @@ def _unmerge_paragraph_translations(
                 ))
             _vprint(verbose, f"[UNMERGE] group gid={entry.merged_container.paragraph_group_id}: "
                     f"parsed {n}/{n} line tags OK")
+        elif has_all_keys and has_empty_lines:
+            # localized cluster-based proportional split
+            non_empty_lines = [i for i in range(1, n + 1) if parsed[i]]
+            if not non_empty_lines:
+                # extreme edge case: all tags empty but present. Treat as single cluster on L1
+                non_empty_lines = [1]
+                parsed[1] = re.sub(r"\[/?L\d+\]", "", raw, flags=re.IGNORECASE).strip()
+
+            cluster_assignments = {}
+            for i in range(1, n + 1):
+                if parsed[i]:
+                    cluster_assignments[i] = i
+                else:
+                    cluster_assignments[i] = min(non_empty_lines, key=lambda x: (abs(x - i), -x))
+
+            clusters = {}
+            for i in range(1, n + 1):
+                clusters.setdefault(cluster_assignments[i], []).append(i)
+
+            line_results = {}
+            for anchor, line_nums in clusters.items():
+                if len(line_nums) == 1:
+                    ci = entry.original_indices[anchor - 1]
+                    line_results[anchor] = ContainerTranslation(
+                        container=original_containers[ci],
+                        translated_text=parsed[anchor],
+                    )
+                else:
+                    cluster_text = parsed[anchor]
+                    src_lengths = [len(original_containers[entry.original_indices[ln - 1]].text) for ln in line_nums]
+                    total_src = sum(src_lengths) or 1
+                    trans_len = len(cluster_text)
+
+                    protected_spans = [m.span() for m in re.finditer(r'\[\[.*?\]\]', cluster_text)]
+                    
+                    def safe_split_point(target: int) -> int:
+                        for start, end in protected_spans:
+                            if start < target < end:
+                                target = start if (target - start) <= (end - target) else end
+                                break
+
+                        if target > 0 and target < trans_len:
+                            prev_ch = cluster_text[target - 1]
+                            prev_is_boundary = prev_ch.isspace() or (unicodedata.category(prev_ch).startswith('P') and prev_ch != '-') or ord(prev_ch) >= 0x2E80
+                            
+                            if not prev_is_boundary:
+                                while target < trans_len:
+                                    ch = cluster_text[target]
+                                    if ch.isspace() or (unicodedata.category(ch).startswith('P') and ch != '-') or ord(ch) >= 0x2E80:
+                                        break
+                                    target += 1
+                        
+                        while target < trans_len and cluster_text[target].isspace():
+                            target += 1
+                            
+                        return target
+
+                    offset = 0
+                    for idx, ln in enumerate(line_nums):
+                        ci = entry.original_indices[ln - 1]
+                        if idx == len(line_nums) - 1:
+                            chunk = cluster_text[offset:]
+                        else:
+                            proportion = src_lengths[idx] / total_src
+                            target_offset = offset + int(round(proportion * trans_len))
+                            safe_offset = safe_split_point(target_offset)
+                            chunk = cluster_text[offset:safe_offset]
+                            offset = safe_offset
+
+                        line_results[ln] = ContainerTranslation(
+                            container=original_containers[ci],
+                            translated_text=chunk.strip(),
+                        )
+
+            for ln in range(1, n + 1):
+                expanded.append(line_results[ln])
+
+            _vprint(verbose, f"[UNMERGE][CLUSTER-FALLBACK] group gid={entry.merged_container.paragraph_group_id}: "
+                    f"localized proportional split executed.")
         else:
             # fallback: delimiters missing or corrupted
             # strip ANY remaining tags (even unpaired/malformed ones) before splitting to prevent [L5] etc. from leaking into the final text.
@@ -1382,7 +1465,23 @@ def _unmerge_paragraph_translations(
             def safe_split_point(target: int) -> int:
                 for start, end in protected_spans:
                     if start < target < end:
-                        return start if (target - start) <= (end - target) else end
+                        target = start if (target - start) <= (end - target) else end
+                        break
+                
+                if target > 0 and target < trans_len:
+                    prev_ch = clean[target - 1]
+                    prev_is_boundary = prev_ch.isspace() or (unicodedata.category(prev_ch).startswith('P') and prev_ch != '-') or ord(prev_ch) >= 0x2E80
+                    
+                    if not prev_is_boundary:
+                        while target < trans_len:
+                            ch = clean[target]
+                            if ch.isspace() or (unicodedata.category(ch).startswith('P') and ch != '-') or ord(ch) >= 0x2E80:
+                                break
+                            target += 1
+                
+                while target < trans_len and clean[target].isspace():
+                    target += 1
+                    
                 return target
 
             offset = 0
@@ -1565,7 +1664,6 @@ def translate_pdf_bytes_pipeline(
         # stage 4: restore & map to plans
         trans_idx = 0
         plans = []
-        from scripts.text_normalization.normalizer import NormalizationState
 
         for i, c in enumerate(orig_containers):
             policy = policies[i]
@@ -1579,8 +1677,6 @@ def translate_pdf_bytes_pipeline(
                 trans_idx += 1
             
             # final restoration of placeholders
-            from scripts.text_normalization.normalizer import repair_placeholders
-            
             # 1) repair malformed placeholders from LLM
             trans_text_repaired = repair_placeholders(trans_text)
             
@@ -1664,6 +1760,15 @@ def translate_pdf_bytes_pipeline(
                     for reason in (d0.get("noop_reason"), d1.get("noop_reason"), d2.get("noop_reason")):
                         if reason and reason not in noop_reasons: noop_reasons.append(reason)
 
+                insights_dict = {}
+                if noop_reasons:
+                    insights_dict["noop_reasons"] = " | ".join(noop_reasons)
+                insights_dict["text_kind"] = getattr(c.kind, "value", str(c.kind))
+                if midx is not None:
+                    gloss_score = llm2_map.get(midx, {}).get("glossary_score")
+                    if gloss_score is not None:
+                        insights_dict["top_glossary_score"] = float(gloss_score)
+
                 logger.log_entry(
                     source_text=c.text,
                     paragraph_group=merged_src,
@@ -1673,7 +1778,7 @@ def translate_pdf_bytes_pipeline(
                     llm2_translation=llm2_text,
                     glossary_term=gloss_hit,
                     final_text=plan.final_rendered_text,
-                    insights={"noop_reasons": " | ".join(noop_reasons)} if noop_reasons else None,
+                    insights=insights_dict if insights_dict else None,
                 )
 
         _print_translation_samples(orig_containers, plans, diagnostics, verbose=verbose)

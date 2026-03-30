@@ -98,51 +98,94 @@ class DocxFormatter:
     # ------------------------------------------------------------------
     # Pass 1 – Collect: gather ALL translatable runs across the document
     # ------------------------------------------------------------------
-    def _collect_all_runs(self, doc) -> tuple:
+    def _collect_paragraph_groups(self, doc):
         """
-        Walk the entire document and return:
-            run_refs – list of live run objects (references into the doc)
-            texts    – list of their current text strings (same order)
-
-        Covers: ALL body paragraphs (including tables/shapes/SDTs) and headers/footers.
+        Returns a list of paragraph groups.
+        Each group = (list_of_runs, full_text)
         """
-        run_refs: list = []
-        texts:    list = []
+        groups = []
+        seen_parts = []  # track processed parts
 
-        # We track seen parts (instead of ephemeral paragraph nodes) to correctly 
-        # avoid processing linked headers/footers multiple times without id() collisions.
-        seen_parts = []
-
-        def _process_part_paragraphs(part_element, parent_obj):
+        def _process_part(part_element, parent_obj):
             if part_element is None:
                 return
+
+            # prevent duplicate processing (headers/footers reuse XML)
             if any(part_element is p for p in seen_parts):
                 return
             seen_parts.append(part_element)
 
             for p_elem in part_element.xpath('.//w:p'):
                 paragraph = Paragraph(p_elem, parent_obj)
-                self._collect_paragraph_runs(paragraph, run_refs, texts)
 
-        # 1. Main Document Body
-        _process_part_paragraphs(doc._element.body, doc._body)
+                runs = []
+                texts = []
 
-        # 2. Headers and footers
+                for r_elem in paragraph._element.xpath('.//w:r'):
+                    run = Run(r_elem, paragraph)
+                    if run.text is not None: # keep EVERYTHING including spaces
+                        runs.append(run)
+                        texts.append(run.text)
+
+                if runs:
+                    full_text = "".join(texts)
+                    groups.append((runs, full_text))
+
+        # Main body
+        _process_part(doc._element.body, doc._body)
+
+        # Headers/Footers (can be shared across sections → duplication risk)
         for section in doc.sections:
-            if section.header is not None:
-                _process_part_paragraphs(section.header._element, section.header)
-            if section.footer is not None:
-                _process_part_paragraphs(section.footer._element, section.footer)
-            if section.first_page_header is not None:
-                _process_part_paragraphs(section.first_page_header._element, section.first_page_header)
-            if section.first_page_footer is not None:
-                _process_part_paragraphs(section.first_page_footer._element, section.first_page_footer)
-            if section.even_page_header is not None:
-                _process_part_paragraphs(section.even_page_header._element, section.even_page_header)
-            if section.even_page_footer is not None:
-                _process_part_paragraphs(section.even_page_footer._element, section.even_page_footer)
+            _process_part(section.header._element if section.header else None, section.header)
+            _process_part(section.footer._element if section.footer else None, section.footer)
 
-        return run_refs, texts
+        return groups
+
+    # def _collect_all_runs(self, doc) -> tuple:
+    #     """
+    #     Walk the entire document and return:
+    #         run_refs – list of live run objects (references into the doc)
+    #         texts    – list of their current text strings (same order)
+
+    #     Covers: ALL body paragraphs (including tables/shapes/SDTs) and headers/footers.
+    #     """
+    #     run_refs: list = []
+    #     texts:    list = []
+
+    #     # We track seen parts (instead of ephemeral paragraph nodes) to correctly 
+    #     # avoid processing linked headers/footers multiple times without id() collisions.
+    #     seen_parts = []
+
+    #     def _process_part_paragraphs(part_element, parent_obj):
+    #         if part_element is None:
+    #             return
+    #         if any(part_element is p for p in seen_parts):
+    #             return
+    #         seen_parts.append(part_element)
+
+    #         for p_elem in part_element.xpath('.//w:p'):
+    #             paragraph = Paragraph(p_elem, parent_obj)
+    #             self._collect_paragraph_runs(paragraph, run_refs, texts)
+
+    #     # 1. Main Document Body
+    #     _process_part_paragraphs(doc._element.body, doc._body)
+
+    #     # 2. Headers and footers
+    #     for section in doc.sections:
+    #         if section.header is not None:
+    #             _process_part_paragraphs(section.header._element, section.header)
+    #         if section.footer is not None:
+    #             _process_part_paragraphs(section.footer._element, section.footer)
+    #         if section.first_page_header is not None:
+    #             _process_part_paragraphs(section.first_page_header._element, section.first_page_header)
+    #         if section.first_page_footer is not None:
+    #             _process_part_paragraphs(section.first_page_footer._element, section.first_page_footer)
+    #         if section.even_page_header is not None:
+    #             _process_part_paragraphs(section.even_page_header._element, section.even_page_header)
+    #         if section.even_page_footer is not None:
+    #             _process_part_paragraphs(section.even_page_footer._element, section.even_page_footer)
+
+    #     return run_refs, texts
 
     # ------------------------------------------------------------------
     # Pass 3 – Format: apply visual formatting to the whole document
@@ -193,6 +236,34 @@ class DocxFormatter:
             if section.even_page_footer is not None:
                 _fmt_part_paragraphs(section.even_page_footer._element, section.even_page_footer, skip_font_enforcement=True)
 
+    def _redistribute_text_to_runs(self, runs, translated_text):
+        """
+        Distribute translated text back to runs based on
+        ORIGINAL CHARACTER PROPORTIONS (not tokens).
+        """
+
+        total_src_len = sum(len(run.text) for run in runs)
+
+        if total_src_len == 0:
+            return
+
+        total_trans_len = len(translated_text)
+        cursor = 0
+
+        for i, run in enumerate(runs):
+            src_len = len(run.text)
+
+            if i == len(runs) - 1:
+                # Last run gets everything remaining
+                run.text = translated_text[cursor:]
+            else:
+                # Proportional allocation
+                proportion = src_len / total_src_len
+                alloc_len = int(round(proportion * total_trans_len))
+
+                run.text = translated_text[cursor: cursor + alloc_len]
+                cursor += alloc_len
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -221,28 +292,51 @@ class DocxFormatter:
         doc = Document(input_doc_path)
 
         # Step 2 – Collect
-        print("Collecting text runs...")
-        run_refs, texts = self._collect_all_runs(doc)
-        print(f"  → {len(texts)} translatable runs found.")
+        print("Collecting paragraph groups...")
+        groups = self._collect_paragraph_groups(doc)
+        print(f"  → {len(groups)} paragraphs found.")
+        # print("Collecting text runs...")
+        # run_refs, texts = self._collect_all_runs(doc)
+        # print(f"  → {len(texts)} translatable runs found.")
+
+        # Extract full paragraph texts
+        paragraph_texts = [full_text for (_, full_text) in groups]
 
         # Step 3 – Batch translate: full 3-stage pipeline (MT → LLM1 → RAG+LLM2)
-        print(f"Translating '{self.from_lang}' → '{self.to_lang}' via 3-stage pipeline ...")
-        translated_texts = self.translator.batch_translate_with_pipeline(
-            texts, self.from_lang, self.to_lang
+        print(f"Translating paragraphs '{self.from_lang}' → '{self.to_lang}' ...")
+        translated_paragraphs = self.translator.batch_translate_with_pipeline(
+            paragraph_texts,
+            self.from_lang,
+            self.to_lang
         )
+        # print(f"Translating '{self.from_lang}' → '{self.to_lang}' via 3-stage pipeline ...")
+        # translated_texts = self.translator.batch_translate_with_pipeline(
+        #     texts, self.from_lang, self.to_lang
+        # )
         # translated_texts = self.translator.batch_translate(
         #     texts, self.to_lang
         # )
-        print(f"  → Pipeline done ({len(translated_texts)} strings).")
+        # print(f"  → Pipeline done ({len(translated_texts)} strings).")
 
         # Step 4 – Write back
-        print("Writing translations back to document runs...")
-        success_count = 0
-        for run, translated in zip(run_refs, translated_texts):
-            if translated is not None and translated != run.text:
-                run.text = translated
-                success_count += 1
-        print(f"  → {success_count} runs updated.")
+        print("Redistributing translated text back to runs...")
+        for (runs, _), translated in zip(groups, translated_paragraphs):
+            if translated:
+                self._redistribute_text_to_runs(runs, translated)
+        # print("Writing translations back to document runs...")
+        # success_count = 0
+        # for run, translated in zip(run_refs, translated_texts):
+        #     if translated is not None and translated != run.text:
+        #         orig = run.text
+        #         translated_clean = translated.strip()
+
+        #         # preserve original spacing
+        #         leading = len(orig) - len(orig.lstrip(" "))
+        #         trailing = len(orig) - len(orig.rstrip(" "))
+
+        #         run.text = (" " * leading) + translated_clean + (" " * trailing)
+        #         success_count += 1
+        # print(f"  → {success_count} runs updated.")
 
         # Step 5 – Apply formatting
         print("Applying document formatting...")
