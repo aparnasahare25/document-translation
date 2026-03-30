@@ -602,9 +602,11 @@ def refine_segment_with_glossary(
     
     if return_full_info:
         top_hit = glossary_paragraphs[0].get("content", "") if glossary_paragraphs else ""
+        top_score = glossary_paragraphs[0].get("score", 0.0) if glossary_paragraphs else 0.0
         return {
             "final_translation": final_tl,
-            "top_glossary_hit": top_hit
+            "top_glossary_hit": top_hit,
+            "top_glossary_score": top_score
         }
     
     return final_tl

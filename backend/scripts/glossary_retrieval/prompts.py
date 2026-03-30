@@ -4,8 +4,12 @@ def get_placeholder_sys_prompt(source_lang: str, target_lang: str, is_short_mode
     
     extra_rules = ""
     if is_short_mode:
-        extra_rules = "\n- SHORT MODE ACTIVE: KEEP TRANSLATIONS MAXIMALLY CONCISE. This text is meant for a narrow UI label or extremely small caption box. Prefer the shortest natural and professionally acceptable translation that fits tight space. Do not omit information that changes meaning, tone, role, or terminology. Avoid unnatural compression and do not over-shorten if translation is already short and is professional and natural."
-        
+        extra_rules += "\n- SHORT MODE ACTIVE: KEEP TRANSLATIONS MAXIMALLY CONCISE. This text is meant for a narrow UI label or extremely small caption box. Prefer the shortest natural and professionally acceptable translation that fits tight space. Do not omit information that changes meaning, tone, role, or terminology. Avoid unnatural compression and do not over-shorten if translation is already short and is professional and natural."
+    
+    # language-specific instructions
+    if source_lang.lower() in ("ja", "jp", "japanese"):
+        extra_rules += f"\n- STRICTLY ALWAYS change Japanese punctuation marks like 【】 brackets, ' apostrophies to the appropriate form for the target language ({target_lang.upper()}). NEVER let Japanese punctuation remain in the translation."
+
     return f"""
 **YOU ARE THE MOST ACCURATE, RELIABLE, AND SPECIALIZED TRANSLATOR ({src_upper} -> {tgt_upper})** WITH OVER 20 YEARS OF EXPERIENCE IN **WRITING AND REVISING GENERAL CORPORATE DOCUMENTS**.
 
@@ -29,7 +33,7 @@ YOU MUST:
 - **STRICTLY NEVER CHANGE** numbers, ranges, torque values, units, part numbers, error codes, abbreviations, IDs, or technical references unless correcting a 100% CLEAR mistake.
 - **STRICTLY ALWAYS PROVIDE YOUR OUTPUT IN {tgt_upper}**. NEVER REVERT THE TRANSLATION BACK TO THE SOURCE LANGUAGE {src_upper}.
 - **PROPER NOUNS**: For names, labels, and fixed expressions, prefer the form that sounds STANDARD and NATURAL in the target-language ({tgt_upper}) context. Do not mechanically transliterate or literally translate if a more established or contextually appropriate form is clearly indicated. Do NOT leave them in source-language ({src_upper}) if they have a target-language ({tgt_upper}) equivalent.
-- PUNCTUATION: You must also use punctuations where required for naturalness and grammaticality in the target language ({tgt_upper}), even if they are not present in the source. However, do NOT add punctuation if it would change the meaning or tone of the original text. Also, keep in mind the differences in punctuation norms and special characters between the source ({src_upper}) and target ({tgt_upper}) languages. Convert punctuation to the appropriate form for the target language ({tgt_upper}) when necessary, but STRICTLY DO NOT add punctuation that changes meaning or tone.
+- PUNCTUATION: You must also use punctuations where required for naturalness and grammaticality in the target language ({tgt_upper}), even if they are not present in the source. However, do NOT add punctuation if it would change the meaning or tone of the original text. Also, keep in mind the differences in punctuation norms and special characters between the source ({src_upper}) and target ({tgt_upper}) languages.
 - **DO NOT** add, omit, soften, intensify, or reinterpret meaning or nuance of the original text.{extra_rules}
 - **KEEP THE FOLLOWING PLACEHOLDERS EXACTLY AS THEY ARE - STRICTLY NEVER CHANGE OR SHIFT THESE**:
     - `[[INLINE0]]`, `[[BLOCK0]]`, `[[BLOCK1]]`, [L1], [/L1], [L2], [/L2], etc.

@@ -621,16 +621,16 @@ def translate_blocks(
     # -------------------------
     final_out: List[str] = list(pass1)
 
-    def llm2_task(i: int) -> Tuple[int, str, float, str]:
+    def llm2_task(i: int) -> Tuple[int, str, float, str, float]:
         t0 = time.perf_counter()
         if skip_mask[i]:
-            return i, src_texts[i], (time.perf_counter() - t0), ""
+            return i, src_texts[i], (time.perf_counter() - t0), "", 0.0
 
         src = src_texts[i].strip()
         cur = pass1[i].strip()
 
         if not src or _should_skip_translation(src):
-            return i, src_texts[i], (time.perf_counter() - t0), ""
+            return i, src_texts[i], (time.perf_counter() - t0), "", 0.0
 
         is_placeholder = ("[[BLOCK" in src) or ("[[INLINE" in src) or bool(_extract_placeholders(src))
         
@@ -652,16 +652,17 @@ def translate_blocks(
             )
             refined = res["final_translation"]
             top_hit = res["top_glossary_hit"]
+            top_score = res.get("top_glossary_score", 0.0)
 
             if is_placeholder and not _preserves_placeholders(refined, src):
                 refined = cur
-            return i, refined if refined else cur, (time.perf_counter() - t0), top_hit
+            return i, refined if refined else cur, (time.perf_counter() - t0), top_hit, top_score
         except Exception as e:
             with stats_lock:
                 counts["llm2_failures"] += 1
                 counts["errors"] += 1
             _safe_print(f"[LLM2] failed at i={i}: {e} -> keep LLM1", verbose=eff_verbose)
-            return i, cur, (time.perf_counter() - t0), ""
+            return i, cur, (time.perf_counter() - t0), "", 0.0
 
     llm2_indices = []
     for i in range(n):
@@ -688,7 +689,7 @@ def translate_blocks(
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(llm2_task, i) for i in llm2_indices]
             for done_idx, fut in enumerate(as_completed(futs), start=1):
-                i, out_t, elapsed, top_hit = fut.result()
+                i, out_t, elapsed, top_hit, top_score = fut.result()
                 final_out[i] = out_t
 
                 with stats_lock:
@@ -703,6 +704,7 @@ def translate_blocks(
                         "original": src_texts[i],
                         "translated": out_t,
                         "glossary_hit": top_hit,
+                        "glossary_score": top_score,
                         "noop_reason": prev.get("noop_reason"),
                     }
 
@@ -762,6 +764,7 @@ def translate_blocks(
             "original": row.get("original", ""),
             "translated": row.get("translated", ""),
             "glossary_hit": row.get("glossary_hit", ""),
+            "glossary_score": row.get("glossary_score", 0.0),
             "noop_reason": row.get("noop_reason", ""),
         })
 

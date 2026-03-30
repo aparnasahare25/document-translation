@@ -71,7 +71,7 @@ class TranslationLogger:
                 if llm2_content:
                     f.write(llm2_content + "\n")
                 
-                if final_text:
+                if final_text is not None:
                     f.write(f"FINAL RESTORED: {final_text}\n")
             
             if insights:

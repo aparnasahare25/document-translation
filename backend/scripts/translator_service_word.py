@@ -41,6 +41,8 @@ def _should_skip(text: str) -> bool:
         return True
     if not _has_alpha(t):
         return True
+    if t.isspace():
+        return True
     if re.fullmatch(r"(https?://\S+|www\.\S+)", t, flags=re.IGNORECASE):
         return True
     return False
@@ -139,7 +141,8 @@ def _llm1_refine(
         context_prev_10=context_prev_10,
         source_lang=source_lang,
         target_lang=target_lang,
-        is_short_mode=is_short_mode
+        is_short_mode=is_short_mode,
+        source_file="word"
     )
     
     system = prompt_data["system"]
