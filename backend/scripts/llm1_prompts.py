@@ -8,7 +8,7 @@ def preview_string(s: str, limit: int = 180) -> str:
 def build_llm1_refinement_prompt(
     source_text: str,
     mt_text: str,
-    context_prev_10: List[Dict[str, str]],
+    previous_chunks: Optional[List[Dict[str, str]]],
     source_lang: str,
     target_lang: str,
     is_short_mode: bool = False,
@@ -64,7 +64,7 @@ def build_llm1_refinement_prompt(
     user_payload = {
         "source_lang": source_lang,
         "target_lang": target_lang,
-        "previous_context": context_prev_10,
+        "previous_context": previous_chunks,
         "source": source_text,
         "machine_translation": mt_text,
         "instructions": "Return only JSON.",
@@ -72,6 +72,8 @@ def build_llm1_refinement_prompt(
 
     if kind: 
         user_payload["container_kind"] = kind
+
+    if previous_chunks: print(f"\n\n\nPREVIOUS CONTEXT ({len(previous_chunks)} chunks):\n{previous_chunks}\n\n\n")
 
     # paragraph context: sibling lines that belong to the same paragraph group; gives the LLM full-sentence context for grammar quality even though each line is translated and placed individually.
     if paragraph_context:

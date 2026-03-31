@@ -488,6 +488,7 @@ def build_refinement_prompt(
     source_lang: str,
     target_lang: str,
     is_short_mode: bool = False,
+    previous_chunks: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """
     LLM sees:
@@ -517,6 +518,11 @@ def build_refinement_prompt(
         "glossary": glossary,
         "output_contract": {"final_translation": "string"},
     }
+    
+    # optional: include previous chunks for more context (disabled by default to save tokens and reduce noise)
+    # if we do include this, update the prompts to use it effectively
+    # if previous_chunks:
+    #     user_payload["previous_chunks"] = previous_chunks
 
     if verbose:
         _print_kv("Glossary paragraphs", str(len(glossary_paragraphs)))
@@ -540,6 +546,7 @@ def refine_segment_with_glossary(
     target_lang: Optional[str] = None,
     is_short_mode: bool = False,
     return_full_info: bool = False,
+    previous_chunks: Optional[List[dict]] = None,
 ) -> Union[str, Dict[str, Any]]:
     """
     Main API:
@@ -589,6 +596,7 @@ def refine_segment_with_glossary(
         source_lang=source_lang or "en",
         target_lang=target_lang or "ja",
         is_short_mode=is_short_mode,
+        previous_chunks=previous_chunks,
     )
 
     llm_output = call_llm_json(prompt["system"], prompt["user_payload"], verbose=verbose)
@@ -603,10 +611,12 @@ def refine_segment_with_glossary(
     if return_full_info:
         top_hit = glossary_paragraphs[0].get("content", "") if glossary_paragraphs else ""
         top_score = glossary_paragraphs[0].get("score", 0.0) if glossary_paragraphs else 0.0
+        all_hits = [p.get("content", "") for p in glossary_paragraphs]
         return {
             "final_translation": final_tl,
             "top_glossary_hit": top_hit,
-            "top_glossary_score": top_score
+            "top_glossary_score": top_score,
+            "all_glossary_hits": all_hits
         }
     
     return final_tl

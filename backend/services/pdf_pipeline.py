@@ -1370,7 +1370,7 @@ def _unmerge_paragraph_translations(
             # localized cluster-based proportional split
             non_empty_lines = [i for i in range(1, n + 1) if parsed[i]]
             if not non_empty_lines:
-                # extreme edge case: all tags empty but present. Treat as single cluster on L1
+                # extreme edge case: all tags empty but present - treat as single cluster on L1
                 non_empty_lines = [1]
                 parsed[1] = re.sub(r"\[/?L\d+\]", "", raw, flags=re.IGNORECASE).strip()
 
@@ -1732,6 +1732,7 @@ def translate_pdf_bytes_pipeline(
             if policy == TranslationPolicy.SKIP:
                 logger.log_entry(
                     source_text=c.text,
+                    chunk_info=(i + 1, len(orig_containers)),
                     skipped=True,
                     skip_reason="Policy SKIP (mostly non-textual or layout restriction)"
                 )
@@ -1768,9 +1769,13 @@ def translate_pdf_bytes_pipeline(
                     gloss_score = llm2_map.get(midx, {}).get("glossary_score")
                     if gloss_score is not None:
                         insights_dict["top_glossary_score"] = float(gloss_score)
+                    all_hits = llm2_map.get(midx, {}).get("all_glossary_hits")
+                    if all_hits:
+                        insights_dict["all_glossary_hits"] = all_hits
 
                 logger.log_entry(
                     source_text=c.text,
+                    chunk_info=(i + 1, len(orig_containers)),
                     paragraph_group=merged_src,
                     inline_blocks=list(plan.protected_tokens_map.keys()) if plan.protected_tokens_map else None,
                     manual_translation=mt_text,

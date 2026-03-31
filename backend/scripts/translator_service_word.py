@@ -128,9 +128,9 @@ def _llm1_refine(
     *,
     source_text: str,
     mt_text: str,
-    context_prev_10: List[dict],
     source_lang: str,
     target_lang: str,
+    previous_chunks: Optional[List[dict]] = None,
     is_placeholder: bool = False,
     is_short_mode: bool = False,
 ) -> str:
@@ -138,7 +138,7 @@ def _llm1_refine(
     prompt_data = build_llm1_refinement_prompt(
         source_text=source_text,
         mt_text=mt_text,
-        context_prev_10=context_prev_10,
+        previous_chunks=previous_chunks,
         source_lang=source_lang,
         target_lang=target_lang,
         is_short_mode=is_short_mode,
@@ -265,6 +265,7 @@ class TranslatorService:
         batch_size: int = 100,
         max_workers: int = WORD_LLM_MAX_WORKERS,
         top_k_paragraphs: int = WORD_TOP_K_PARAGRAPHS,
+        rolling_context_size: Optional[int] = 3,
     ) -> List[Optional[str]]:
         """
         Full 3-stage translation pipeline for Word (.docx) runs:
@@ -336,11 +337,12 @@ class TranslatorService:
             src = (texts[i] or "").strip()
             mt  = (mt_out[i] or "").strip()
 
-            # Rolling context: previous 10 runs (src + mt pairs)
-            ctx = [
-                {"src": texts[j], "mt": mt_out[j]}
-                for j in range(max(0, i - 10), i)
-            ]
+            ctx: Optional[List[dict]] = None
+            if rolling_context_size is not None and rolling_context_size > 0:
+                ctx = [
+                    {"src": texts[j], "mt": mt_out[j]}
+                    for j in range(max(0, i - rolling_context_size), i)
+                ]
 
             is_placeholder = bool(_extract_placeholders(src))
             # Short mode: very short text (likely a label/caption)
@@ -351,7 +353,7 @@ class TranslatorService:
                     aoai,
                     source_text=src,
                     mt_text=mt,
-                    context_prev_10=ctx,
+                    previous_chunks=ctx,
                     source_lang=source_lang,
                     target_lang=target_lang,
                     is_placeholder=is_placeholder,
@@ -406,6 +408,13 @@ class TranslatorService:
             is_placeholder = bool(_extract_placeholders(src))
             is_short_mode = len(src) <= 20
 
+            ctx_llm2: Optional[List[dict]] = None
+            if rolling_context_size is not None and rolling_context_size > 0:
+                ctx_llm2 = [
+                    {"src": texts[j], "mt": pass1[j]}
+                    for j in range(max(0, i - rolling_context_size), i)
+                ]
+
             try:
                 refined = refine_segment_with_glossary(
                     source_chunk=src,
@@ -416,6 +425,7 @@ class TranslatorService:
                     source_lang=source_lang,
                     target_lang=target_lang,
                     is_short_mode=is_short_mode,
+                    previous_chunks=ctx_llm2,
                 )
                 # Placeholder safety net
                 if is_placeholder and not _preserves_placeholders(refined, src):

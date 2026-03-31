@@ -211,9 +211,9 @@ def _llm1_refine(
     *,
     source_text: str,
     mt_text: str,
-    context_prev_10: List[Dict[str, str]],
     source_lang: str,
     target_lang: str,
+    previous_chunks: Optional[List[Dict[str, str]]] = None,
     is_placeholder: bool = False,
     is_short_mode: bool = False,
     kind: Optional[str] = None,
@@ -222,7 +222,7 @@ def _llm1_refine(
     prompt_data = build_llm1_refinement_prompt(
         source_text=source_text,
         mt_text=mt_text,
-        context_prev_10=context_prev_10,
+        previous_chunks=previous_chunks,
         source_lang=_norm_lang(source_lang),
         target_lang=_norm_lang(target_lang),
         is_short_mode=is_short_mode,
@@ -259,10 +259,6 @@ def _llm1_refine(
 
     return cand if cand else mt_text
 
-
-# -----------------------------
-# public API: translate_blocks
-# -----------------------------
 def translate_blocks(
     blocks: List[ContainerRef],
     *,
@@ -270,6 +266,7 @@ def translate_blocks(
     target_lang: Optional[str] = None,
     max_workers: Optional[int] = None,
     top_k_paragraphs: int = 5,
+    rolling_context_size: Optional[int] = 3,
     verbose: Optional[bool] = None,
     return_diagnostics: bool = False,
     with_diagnostics: bool = False,
@@ -279,7 +276,7 @@ def translate_blocks(
     """
     Three-step pipeline (no cache):
         1) Azure Translator (baseline MT)
-        2) LLM1 (grammar / structure fix) — uses prev 10 chunks (src + mt) as context
+        2) LLM1 (grammar / structure fix) — uses rolling chunks (src + mt) as context
         3) LLM2 (RAG refine) — uses refine_segment_with_glossary(), language-only filters
 
     Multithreading:
@@ -486,12 +483,14 @@ def translate_blocks(
         if skip_mask[i]:
             return i, src_texts[i], (time.perf_counter() - t0)
 
-        # rolling 10-chunk context (cross-paragraph continuity)
-        ctx: List[Dict[str, str]] = []
-        start = max(0, i - 10)
-        for j in range(start, i):
-            if j == start: _safe_print(f"Passing up to 10 previous chunks as context to LLM 1, beginning from #{j} - {_preview(src_texts[j])} -> {_preview(mt_out[j])}", verbose=eff_verbose)
-            ctx.append({"src": src_texts[j], "mt": mt_out[j]})
+        # rolling context (cross-paragraph continuity)
+        ctx: Optional[List[Dict[str, str]]] = None
+        if rolling_context_size is not None and rolling_context_size > 0:
+            ctx = []
+            start = max(0, i - rolling_context_size)
+            for j in range(start, i):
+                if j == start: _safe_print(f"Passing up to {rolling_context_size} previous chunks as context to LLM 1, beginning from #{j} - {_preview(src_texts[j])} -> {_preview(mt_out[j])}", verbose=eff_verbose)
+                ctx.append({"src": src_texts[j], "mt": mt_out[j]})
 
         src = src_texts[i].strip()
         mt = mt_out[i].strip()
@@ -518,7 +517,7 @@ def translate_blocks(
                 aoai,
                 source_text=src,
                 mt_text=mt,
-                context_prev_10=ctx,
+                previous_chunks=ctx,
                 source_lang=source_lang,
                 target_lang=target_lang,
                 is_placeholder=is_placeholder,
@@ -621,23 +620,30 @@ def translate_blocks(
     # -------------------------
     final_out: List[str] = list(pass1)
 
-    def llm2_task(i: int) -> Tuple[int, str, float, str, float]:
+    def llm2_task(i: int) -> Tuple[int, str, float, str, float, list]:
         t0 = time.perf_counter()
         if skip_mask[i]:
-            return i, src_texts[i], (time.perf_counter() - t0), "", 0.0
+            return i, src_texts[i], (time.perf_counter() - t0), "", 0.0, []
 
         src = src_texts[i].strip()
         cur = pass1[i].strip()
 
         if not src or _should_skip_translation(src):
-            return i, src_texts[i], (time.perf_counter() - t0), "", 0.0
+            return i, src_texts[i], (time.perf_counter() - t0), "", 0.0, []
 
         is_placeholder = ("[[BLOCK" in src) or ("[[INLINE" in src) or bool(_extract_placeholders(src))
         
         kind_val = blocks[i].kind.value if hasattr(blocks[i].kind, "value") else str(blocks[i].kind)
         is_short_mode = (kind_val == "LABEL")
 
-        # OPTIONAL: can use prev 10 pass1 chunks as extra context inside your refine function
+        ctx_llm2: Optional[List[Dict[str, str]]] = None
+        if rolling_context_size is not None and rolling_context_size > 0:
+            ctx_llm2 = []
+            start = max(0, i - rolling_context_size)
+            for j in range(start, i):
+                ctx_llm2.append({"src": src_texts[j], "mt": pass1[j]})
+
+        # optional: can use previous chunks as extra context inside refine function
         try:
             res = refine_segment_with_glossary(
                 source_chunk=src,
@@ -649,20 +655,22 @@ def translate_blocks(
                 target_lang=target_lang,
                 is_short_mode=is_short_mode,
                 return_full_info=True,
+                previous_chunks=ctx_llm2,
             )
             refined = res["final_translation"]
             top_hit = res["top_glossary_hit"]
             top_score = res.get("top_glossary_score", 0.0)
+            all_hits = res.get("all_glossary_hits", [])
 
             if is_placeholder and not _preserves_placeholders(refined, src):
                 refined = cur
-            return i, refined if refined else cur, (time.perf_counter() - t0), top_hit, top_score
+            return i, refined if refined else cur, (time.perf_counter() - t0), top_hit, top_score, all_hits
         except Exception as e:
             with stats_lock:
                 counts["llm2_failures"] += 1
                 counts["errors"] += 1
             _safe_print(f"[LLM2] failed at i={i}: {e} -> keep LLM1", verbose=eff_verbose)
-            return i, cur, (time.perf_counter() - t0), "", 0.0
+            return i, cur, (time.perf_counter() - t0), "", 0.0, []
 
     llm2_indices = []
     for i in range(n):
@@ -689,7 +697,7 @@ def translate_blocks(
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(llm2_task, i) for i in llm2_indices]
             for done_idx, fut in enumerate(as_completed(futs), start=1):
-                i, out_t, elapsed, top_hit, top_score = fut.result()
+                i, out_t, elapsed, top_hit, top_score, all_hits = fut.result()
                 final_out[i] = out_t
 
                 with stats_lock:
@@ -705,6 +713,7 @@ def translate_blocks(
                         "translated": out_t,
                         "glossary_hit": top_hit,
                         "glossary_score": top_score,
+                        "all_glossary_hits": all_hits,
                         "noop_reason": prev.get("noop_reason"),
                     }
 
@@ -765,6 +774,7 @@ def translate_blocks(
             "translated": row.get("translated", ""),
             "glossary_hit": row.get("glossary_hit", ""),
             "glossary_score": row.get("glossary_score", 0.0),
+            "all_glossary_hits": row.get("all_glossary_hits", []),
             "noop_reason": row.get("noop_reason", ""),
         })
 
