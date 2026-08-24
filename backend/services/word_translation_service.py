@@ -1,16 +1,39 @@
 import os
 import sys
 import time
+from typing import Optional
 
 # Add project root to sys.path so 'scripts' package is importable
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from docx import Document
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt
 from docx.text.run import Run
 from docx.text.paragraph import Paragraph
 from scripts.translator_service_word import TranslatorService
+
+# Target-language display font: Word keeps separate font slots for Latin vs.
+# East Asian text, so translated CJK text won't actually render in the right
+# typeface unless w:eastAsia is set explicitly alongside w:ascii/w:hAnsi.
+_TARGET_FONT_BY_LANG_PREFIX = {
+    "en": "Arial",
+    "ja": "MS Gothic",
+}
+
+
+def _resolve_target_font(to_lang: str) -> Optional[str]:
+    """Map a target language code to a display font.
+
+    Returns None (leave the document's original font untouched) for any
+    target language other than English/Japanese.
+    """
+    t = (to_lang or "").strip().lower()
+    for prefix, font_name in _TARGET_FONT_BY_LANG_PREFIX.items():
+        if t.startswith(prefix):
+            return font_name
+    return None
 
 
 class DocxFormatter:
@@ -56,13 +79,17 @@ class DocxFormatter:
     # Helper: apply post-translation formatting to a single paragraph
     # ------------------------------------------------------------------
     @staticmethod
-    def _format_paragraph_structure(paragraph, skip_font_enforcement: bool = False):
+    def _format_paragraph_structure(paragraph, skip_font_enforcement: bool = False, target_font: Optional[str] = None):
         """
         Apply structural/visual formatting to a paragraph's runs AFTER text
         has already been translated and written back.
 
         - Resets character spacing to normal (avoids layout issues with
           CJK / wide-character scripts).
+        - Forces the run's font family to `target_font` (Arial for English,
+          MS Gothic for Japanese) on both the Latin and East Asian font
+          slots, so translated text renders correctly regardless of what
+          font the source document originally used.
         - Preserves the original paragraph alignment.
         - Font-size enforcement is kept commented out; uncomment if needed.
         """
@@ -75,6 +102,23 @@ class DocxFormatter:
                     run.font._element.set("spc", "0")
             except Exception as e:
                 print(f"[format] Error adjusting character spacing: {e}")
+
+            # Font family: force the target-language display font.
+            if target_font:
+                try:
+                    run.font.name = target_font  # sets w:ascii / w:hAnsi
+                    rPr = run._element.get_or_add_rPr()
+                    rFonts = rPr.find(qn("w:rFonts"))
+                    if rFonts is None:
+                        rFonts = OxmlElement("w:rFonts")
+                        rPr.append(rFonts)
+                    # w:ascii/w:hAnsi cover Latin text; w:eastAsia controls
+                    # CJK glyphs and w:cs covers complex-script runs — set
+                    # both explicitly or Word falls back to the theme font.
+                    rFonts.set(qn("w:eastAsia"), target_font)
+                    rFonts.set(qn("w:cs"), target_font)
+                except Exception as e:
+                    print(f"[format] Error setting font family: {e}")
 
             # Uncomment the block below to enforce a fixed font size:
             # if run.font is not None and not skip_font_enforcement:
@@ -195,6 +239,8 @@ class DocxFormatter:
         Walk the document again and apply structural formatting (spacing,
         alignment, table wrap) AFTER translations have been written back.
         """
+        target_font = _resolve_target_font(self.to_lang)
+
         # 1. Tables: fix cell wrapping ONLY
         for table in doc.tables:
             table.autofit = False
@@ -216,7 +262,7 @@ class DocxFormatter:
             from docx.text.paragraph import Paragraph
             for p_elem in part_element.xpath('.//w:p'):
                 paragraph = Paragraph(p_elem, parent_obj)
-                self._format_paragraph_structure(paragraph, skip_font_enforcement=skip_font_enforcement)
+                self._format_paragraph_structure(paragraph, skip_font_enforcement=skip_font_enforcement, target_font=target_font)
 
         # Main Document Body
         _fmt_part_paragraphs(doc._element.body, doc._body)

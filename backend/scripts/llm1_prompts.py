@@ -35,8 +35,11 @@ def build_llm1_refinement_prompt(
         "   - NEVER add extra commentary, chat, or information. This includes any auto-completion of facts, prefatory remarks, explanations, apologies, or notes about the translation process. Provide ONLY the translation text as output.",
     ]
     # file-type specific instructions
-    if source_file == "word":
-        print("Applying WORD file instructions")
+    # word and pptx both redistribute the translated paragraph text back across
+    # the original runs by character-length proportion, so both need the
+    # translation length/spacing to line up predictably with the source.
+    if source_file in ("word", "pptx"):
+        print(f"Applying {source_file.upper()} file instructions")
         system_lines.append("   - CRITICAL: STRICTLY PRESERVE ALL WHITESPACE EXACTLY as in the input. Do NOT remove, add, or shift spaces between words, even if the spacing appears unnatural.\n   - NEVER merge words together. If two words are separated by a space in the input, they MUST remain separated in the output.")
 
     # kind-aware specific instructions

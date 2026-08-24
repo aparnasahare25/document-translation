@@ -1856,20 +1856,35 @@ def translate_pdf_bytes_pipeline(
 
 
 if __name__ == "__main__":
-    path = r"C:\Users\AdityaPathak\Downloads\AdityaPathak_Jan2026 - Copy.pdf"
-    with open(path, "rb") as f:
-        pdf_bytes = f.read()
+    # Standalone file-in -> file-out run, mirroring
+    # services/word_translation_service.py and services/pptx_translation_service.py's
+    # __main__ blocks: edit from_lang/to_lang/input_pdf_path below and run
+    # `python backend\services\pdf_pipeline.py` directly (no server needed).
+    from_lang = "ja"
+    to_lang = "en"
+    input_pdf_path = r"C:\gen_ai\document-translation\backend\data\pdf file\example.pdf"
+    file_extension = os.path.splitext(input_pdf_path)[1]
+    input_pdf_name = os.path.splitext(os.path.basename(input_pdf_path))[0]
+    output_pdf_path = f"{input_pdf_name}_{from_lang}_{to_lang}{file_extension}"
 
     # toggle verbose logs here for local runs
     verbose = True
 
-    doc, blocks = extract_all_blocks(pdf_bytes, verbose=verbose)
-    try:
-        print(f"Extracted blocks: {len(blocks)}")
-        for b in blocks[:80]:
-            print(f"[p{b.page_index}] {b.bbox} :: {b.text}")
-    finally:
-        doc.close()
+    with open(input_pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    translated_bytes = translate_pdf_bytes_pipeline(
+        pdf_bytes,
+        source_lang=from_lang,
+        target_lang=to_lang,
+        verbose=verbose,
+        filename=os.path.basename(input_pdf_path),
+    )
+
+    with open(output_pdf_path, "wb") as f:
+        f.write(translated_bytes)
+
+    print(f"\nDone! Translated PDF saved to: {output_pdf_path}")
 
 
 

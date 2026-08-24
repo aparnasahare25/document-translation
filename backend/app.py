@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io, os
+from urllib.parse import quote
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
@@ -37,7 +38,14 @@ async def translate_pdf(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
-    headers = {"Content-Disposition": f'attachment; filename="translated_{source_lang}_to_{target_lang}_{file.filename}"'}
+    download_name = f"translated_{source_lang}_to_{target_lang}_{file.filename}"
+    ascii_fallback = download_name.encode("ascii", "ignore").decode("ascii") or "translated.pdf"
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="{ascii_fallback}"; '
+            f"filename*=UTF-8''{quote(download_name)}"
+        )
+    }
     return StreamingResponse(io.BytesIO(out_bytes), media_type="application/pdf", headers=headers)
 
 
