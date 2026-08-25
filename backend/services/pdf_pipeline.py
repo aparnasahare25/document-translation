@@ -4,7 +4,14 @@ from dotenv import load_dotenv
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
-import os, fitz, io, re, threading, time, inspect, math, unicodedata # PyMuPDF (used for writing back into the PDF)
+import os, sys, fitz, io, re, threading, time, inspect, math, unicodedata # PyMuPDF (used for writing back into the PDF)
+
+# Add project root (backend/) to sys.path so 'services'/'scripts' are
+# importable regardless of the caller's working directory — same bootstrap
+# as services/word_translation_service.py and services/pptx_translation_service.py,
+# needed to run this file standalone (`python backend\services\pdf_pipeline.py`)
+# from outside the backend/ directory.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Azure Document Intelligence
 from azure.core.credentials import AzureKeyCredential
@@ -1862,7 +1869,7 @@ if __name__ == "__main__":
     # `python backend\services\pdf_pipeline.py` directly (no server needed).
     from_lang = "ja"
     to_lang = "en"
-    input_pdf_path = r"C:\gen_ai\document-translation\backend\data\pdf file\example.pdf"
+    input_pdf_path = r"C:\Users\Admin\Desktop\PPT Translation\Japanese to English Translation\PPT Translation via PDF flow\METI document for JAMA SC Committee. Dec 2024 JPN .pdf"
     file_extension = os.path.splitext(input_pdf_path)[1]
     input_pdf_name = os.path.splitext(os.path.basename(input_pdf_path))[0]
     output_pdf_path = f"{input_pdf_name}_{from_lang}_{to_lang}{file_extension}"
